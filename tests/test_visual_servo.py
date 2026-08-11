@@ -13,6 +13,7 @@ from visual_servo_perception import (
     estimate_target_from_points,
     select_servo_target,
 )
+from ensure_simulation_stopped import is_grasp_connector_alias
 
 
 def test_top_down_grasp_pose_has_expected_height_and_axis():
@@ -117,3 +118,9 @@ def test_local_geometry_tracker_recovers_box_center_without_color():
     assert observation is not None
     assert np.linalg.norm(observation.center_base_m - center) < 0.003
     assert observation.point_count >= 35
+
+
+def test_stale_connector_alias_recognizes_underscore_and_hyphen_names():
+    assert is_grasp_connector_alias("grasp_connector_rand_cube_01")
+    assert is_grasp_connector_alias("grasp-connector-rand-cube-01")
+    assert not is_grasp_connector_alias("gripper_tip")

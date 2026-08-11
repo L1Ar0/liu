@@ -79,6 +79,13 @@ def parse_args() -> argparse.Namespace:
         help="disable the explicit post-closure CoppeliaSim connector",
     )
     parser.add_argument(
+        "--servo-lift-height-mm",
+        type=float,
+        default=1000.0
+        * float(os.environ.get("ROBOT_GRASP_SERVO_LIFT_M", "0.150")),
+        help="vertical lift distance after attachment; default 150 mm",
+    )
+    parser.add_argument(
         "--depth-grasp-checkpoint",
         type=str,
         help="optionally run a trained depth-only PPO proposal checkpoint",
@@ -108,6 +115,8 @@ def main() -> None:
     args = parse_args()
     if args.servo_execute_grasp and not args.visual_servo:
         raise SystemExit("--servo-execute-grasp requires --visual-servo")
+    if args.servo_lift_height_mm <= 0.0:
+        raise SystemExit("--servo-lift-height-mm must be positive")
     environment = os.environ.copy()
     environment["ROBOT_GRASP_PREDICTION_JSON"] = str(
         ROOT / "recognition_output" / "recognition_results.json"
@@ -130,6 +139,9 @@ def main() -> None:
     environment.pop("ROBOT_GRASP_ALLOW_GT_COUNT", None)
     environment["ROBOT_GRASP_USE_CONNECTOR"] = "0" if args.no_connector else "1"
     environment["ROBOT_GRASP_SERVO_GRASP_ORIENTATION"] = args.servo_grasp_orientation
+    environment["ROBOT_GRASP_SERVO_LIFT_M"] = str(
+        float(args.servo_lift_height_mm) / 1000.0
+    )
 
     print(
         f"\nGeometry-only pipeline: mode={args.mode}, views={view_count}, "

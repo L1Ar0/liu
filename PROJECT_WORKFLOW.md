@@ -56,6 +56,19 @@ For deterministic contact-scene regression, use one of `leaning`, `stack`,
 `bridge`, `partial_support`, `side_contact`, `table_only`, or `mixed` through
 `--planned-layout`.
 
+Force a vertical stack while keeping object poses and composition random:
+
+```powershell
+.\.venv\Scripts\python.exe pipeline_runner.py `
+  --mode planned `
+  --planned-layout stack `
+  --views 2 `
+  --visual-servo `
+  --servo-execute-grasp `
+  --servo-lift-height-mm 150 `
+  --headless
+```
+
 Main outputs:
 
 - `segmentation_output/view_01_object_cloud.ply`
@@ -120,6 +133,11 @@ Visual-servo outputs:
 
 The summary records convergence, final pose error, target-loss state, grasp
 verification and `uses_color_features: false`.
+
+Connector attachment snaps the selected primitive centre to `gripper_tip`
+before the lift. The default lift is 150 mm and can be changed with
+`--servo-lift-height-mm`. At the beginning of the next pipeline run, stale
+`grasp_connector_rand_*` dummies are detached and removed automatically.
 
 The default grasp orientation is `auto`: upright objects use a top-down frame,
 while a geometrically fitted tilted object uses a surface-aligned frame capped

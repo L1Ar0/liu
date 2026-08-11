@@ -69,7 +69,7 @@ SERVO_FINAL_ORIENTATION_TOLERANCE_RAD = math.radians(
 SERVO_MIN_TCP_TABLE_CLEARANCE_M = float(
     os.environ.get("ROBOT_GRASP_SERVO_MIN_TCP_TABLE_CLEARANCE_M", "0.025")
 )
-SERVO_LIFT_M = float(os.environ.get("ROBOT_GRASP_SERVO_LIFT_M", "0.080"))
+SERVO_LIFT_M = float(os.environ.get("ROBOT_GRASP_SERVO_LIFT_M", "0.150"))
 SERVO_GRASP_MIN_CONFIDENCE = float(
     os.environ.get("ROBOT_GRASP_SERVO_GRASP_MIN_CONFIDENCE", "0.55")
 )
@@ -567,24 +567,34 @@ def _attach_connector(
     if respondable_param is not None:
         sim.setObjectInt32Param(target_handle, respondable_param, 0)
 
+    target_center_before = np.asarray(
+        sim.getObjectPosition(target_handle, -1), dtype=np.float64
+    )
+    tip_pose = list(sim.getObjectPose(tip, -1))
     connector_handle: int | None = None
     connector_alias = f"grasp_connector_{target_alias}"
     try:
-        connector_handle = int(sim.createDummy(0.008))
+        connector_handle = int(sim.createDummy(0.002))
         try:
             sim.setObjectAlias(connector_handle, connector_alias)
         except Exception:
             pass
         try:
-            world_pose = sim.getObjectPose(target_handle, -1)
+            sim.setObjectPose(connector_handle, tip_pose, -1)
             sim.setObjectParent(connector_handle, tip, True)
-            sim.setObjectPose(connector_handle, world_pose, -1)
+            sim.setObjectPosition(target_handle, -1, tip_pose[:3])
             sim.setObjectParent(target_handle, connector_handle, True)
         except Exception:
+            sim.setObjectPosition(target_handle, -1, tip_pose[:3])
             sim.setObjectParent(target_handle, tip, True)
             connector_handle = None
     except Exception:
+        sim.setObjectPosition(target_handle, -1, tip_pose[:3])
         sim.setObjectParent(target_handle, tip, True)
+
+    target_center_after = np.asarray(
+        sim.getObjectPosition(target_handle, -1), dtype=np.float64
+    )
 
     return {
         "attached": True,
@@ -593,6 +603,13 @@ def _attach_connector(
         "target_alias": target_alias,
         "connector_handle": connector_handle,
         "connector_alias": connector_alias if connector_handle is not None else None,
+        "center_snapped_to_tip": True,
+        "target_center_before_m": target_center_before.tolist(),
+        "target_center_after_m": target_center_after.tolist(),
+        "tip_center_m": [float(value) for value in tip_pose[:3]],
+        "snap_distance_mm": float(
+            np.linalg.norm(target_center_after - target_center_before) * 1000.0
+        ),
     }
 
 
