@@ -41,7 +41,7 @@ OUTPUT_DIR = ROOT / "visual_servo_output"
 SUMMARY_FILE = OUTPUT_DIR / "visual_servo_summary.json"
 TRACE_FILE = OUTPUT_DIR / "visual_servo_trace.csv"
 
-SERVO_RATE_HZ = float(os.environ.get("ROBOT_GRASP_SERVO_RATE_HZ", "10"))
+SERVO_RATE_HZ = float(os.environ.get("ROBOT_GRASP_SERVO_RATE_HZ", "15"))
 SERVO_PREGRASP_STANDOFF_M = float(
     os.environ.get("ROBOT_GRASP_SERVO_PREGRASP_STANDOFF_M", "0.090")
 )
@@ -49,16 +49,23 @@ SERVO_FINAL_STANDOFF_M = float(
     os.environ.get("ROBOT_GRASP_SERVO_FINAL_STANDOFF_M", "0.012")
 )
 SERVO_MAX_ITERATIONS = int(
-    os.environ.get("ROBOT_GRASP_SERVO_MAX_ITERATIONS", "70")
+    os.environ.get("ROBOT_GRASP_SERVO_MAX_ITERATIONS", "90")
 )
 SERVO_LOST_LIMIT = int(os.environ.get("ROBOT_GRASP_SERVO_LOST_LIMIT", "5"))
 SERVO_STABLE_FRAMES = int(os.environ.get("ROBOT_GRASP_SERVO_STABLE_FRAMES", "3"))
-SERVO_PREGRASP_STEPS = int(os.environ.get("ROBOT_GRASP_SERVO_PREGRASP_STEPS", "45"))
+SERVO_PREGRASP_STEPS = int(os.environ.get("ROBOT_GRASP_SERVO_PREGRASP_STEPS", "60"))
+SERVO_PREGRASP_DURATION_S = float(
+    os.environ.get("ROBOT_GRASP_SERVO_PREGRASP_DURATION_S", "2.0")
+)
+SERVO_LIFT_STEPS = int(os.environ.get("ROBOT_GRASP_SERVO_LIFT_STEPS", "60"))
+SERVO_LIFT_DURATION_S = float(
+    os.environ.get("ROBOT_GRASP_SERVO_LIFT_DURATION_S", "2.0")
+)
 SERVO_POSITION_TOLERANCE_M = float(
     os.environ.get("ROBOT_GRASP_SERVO_POSITION_TOLERANCE_M", "0.003")
 )
 SERVO_FINAL_POSITION_TOLERANCE_M = float(
-    os.environ.get("ROBOT_GRASP_SERVO_FINAL_POSITION_TOLERANCE_M", "0.0025")
+    os.environ.get("ROBOT_GRASP_SERVO_FINAL_POSITION_TOLERANCE_M", "0.0045")
 )
 SERVO_ORIENTATION_TOLERANCE_RAD = math.radians(
     float(os.environ.get("ROBOT_GRASP_SERVO_ORIENTATION_TOLERANCE_DEG", "5"))
@@ -78,6 +85,39 @@ SERVO_GRASP_MIN_POINTS = int(
 )
 SERVO_GRASP_MIN_IMAGE_MARGIN_PX = float(
     os.environ.get("ROBOT_GRASP_SERVO_GRASP_MIN_IMAGE_MARGIN_PX", "20")
+)
+SERVO_TRACK_CENTER_ALPHA = float(
+    os.environ.get("ROBOT_GRASP_SERVO_TRACK_CENTER_ALPHA", "0.20")
+)
+SERVO_TRACK_MAX_UPDATE_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_TRACK_MAX_UPDATE_M", "0.0015")
+)
+SERVO_ALIGN_MAX_LINEAR_SPEED_M_S = float(
+    os.environ.get("ROBOT_GRASP_SERVO_ALIGN_MAX_LINEAR_SPEED_M_S", "0.025")
+)
+SERVO_APPROACH_MAX_LINEAR_SPEED_M_S = float(
+    os.environ.get("ROBOT_GRASP_SERVO_APPROACH_MAX_LINEAR_SPEED_M_S", "0.030")
+)
+SERVO_APPROACH_SLOW_LINEAR_SPEED_M_S = float(
+    os.environ.get("ROBOT_GRASP_SERVO_APPROACH_SLOW_LINEAR_SPEED_M_S", "0.008")
+)
+SERVO_APPROACH_SLOW_ZONE_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_APPROACH_SLOW_ZONE_M", "0.020")
+)
+SERVO_MAX_ANGULAR_SPEED_DEG_S = float(
+    os.environ.get("ROBOT_GRASP_SERVO_MAX_ANGULAR_SPEED_DEG_S", "18.0")
+)
+SERVO_ALIGN_MAX_TRANSLATION_STEP_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_ALIGN_MAX_TRANSLATION_STEP_M", "0.0018")
+)
+SERVO_APPROACH_MAX_TRANSLATION_STEP_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_APPROACH_MAX_TRANSLATION_STEP_M", "0.0020")
+)
+SERVO_APPROACH_SLOW_TRANSLATION_STEP_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_APPROACH_SLOW_TRANSLATION_STEP_M", "0.0007")
+)
+SERVO_MAX_ROTATION_STEP_DEG = float(
+    os.environ.get("ROBOT_GRASP_SERVO_MAX_ROTATION_STEP_DEG", "1.2")
 )
 GRIPPER_SIGNAL_NAME = os.environ.get("ROBOT_GRASP_RG2_SIGNAL", "RG2_open")
 GRIPPER_OPEN_VALUE = int(os.environ.get("ROBOT_GRASP_RG2_OPEN_VALUE", "1"))
@@ -324,21 +364,46 @@ class IncrementalIK:
                 )
         return self.current_pose()
 
-    def move_linear(self, target_pose: np.ndarray, steps: int, table_plane: np.ndarray) -> np.ndarray:
+    def move_linear(
+        self,
+        target_pose: np.ndarray,
+        steps: int,
+        table_plane: np.ndarray,
+        duration_s: float | None = None,
+    ) -> np.ndarray:
         start = self.current_pose()
         final = np.asarray(target_pose, dtype=np.float64)
+        step_count = max(1, int(steps))
+        duration = (
+            float(duration_s)
+            if duration_s is not None
+            else step_count / max(SERVO_RATE_HZ, 1.0)
+        )
+        start_rotation = Rotation.from_matrix(start[:3, :3])
+        rotation_delta = (
+            start_rotation.inv() * Rotation.from_matrix(final[:3, :3])
+        ).as_rotvec()
         last = start
-        for index in range(1, max(1, int(steps)) + 1):
-            ratio = index / max(1, int(steps))
-            position = (1.0 - ratio) * start[:3, 3] + ratio * final[:3, 3]
+        for index in range(1, step_count + 1):
+            ratio = index / step_count
+            # Cubic smoothstep gives zero velocity at both ends.  The same
+            # scalar is used for translation and quaternion-equivalent SLERP
+            # so the TCP does not snap into its final orientation.
+            smooth_ratio = ratio * ratio * (3.0 - 2.0 * ratio)
+            position = (
+                (1.0 - smooth_ratio) * start[:3, 3]
+                + smooth_ratio * final[:3, 3]
+            )
             if _table_signed_height(position, table_plane) < SERVO_MIN_TCP_TABLE_CLEARANCE_M:
                 raise RuntimeError("Visual-servo path violated table clearance")
-            rotation = final[:3, :3]
+            rotation = (
+                start_rotation * Rotation.from_rotvec(smooth_ratio * rotation_delta)
+            ).as_matrix()
             pose = np.eye(4, dtype=np.float64)
             pose[:3, 3] = position
             pose[:3, :3] = rotation
             last = self.apply(pose)
-            time.sleep(1.0 / max(SERVO_RATE_HZ, 1.0) / max(steps, 1))
+            time.sleep(duration / step_count)
         return last
 
     def close(self) -> None:
@@ -571,6 +636,8 @@ def _attach_connector(
         sim.getObjectPosition(target_handle, -1), dtype=np.float64
     )
     tip_pose = list(sim.getObjectPose(tip, -1))
+    target_pose = list(sim.getObjectPose(target_handle, -1))
+    tip_position = np.asarray(tip_pose[:3], dtype=np.float64)
     connector_handle: int | None = None
     connector_alias = f"grasp_connector_{target_alias}"
     try:
@@ -580,16 +647,18 @@ def _attach_connector(
         except Exception:
             pass
         try:
-            sim.setObjectPose(connector_handle, tip_pose, -1)
+            # Place the connector at the object's current world pose first.
+            # Parenting it to the tip with keepInPlace=True preserves the
+            # measured object-to-tip offset during the subsequent lift.
+            sim.setObjectPose(connector_handle, target_pose, -1)
             sim.setObjectParent(connector_handle, tip, True)
-            sim.setObjectPosition(target_handle, -1, tip_pose[:3])
             sim.setObjectParent(target_handle, connector_handle, True)
         except Exception:
-            sim.setObjectPosition(target_handle, -1, tip_pose[:3])
+            # Fallback still preserves the current world pose.  It is less
+            # explicit than the connector dummy but never snaps the object.
             sim.setObjectParent(target_handle, tip, True)
             connector_handle = None
     except Exception:
-        sim.setObjectPosition(target_handle, -1, tip_pose[:3])
         sim.setObjectParent(target_handle, tip, True)
 
     target_center_after = np.asarray(
@@ -603,13 +672,17 @@ def _attach_connector(
         "target_alias": target_alias,
         "connector_handle": connector_handle,
         "connector_alias": connector_alias if connector_handle is not None else None,
-        "center_snapped_to_tip": True,
+        "center_snapped_to_tip": False,
+        "relative_attachment_preserved": True,
         "target_center_before_m": target_center_before.tolist(),
         "target_center_after_m": target_center_after.tolist(),
         "tip_center_m": [float(value) for value in tip_pose[:3]],
         "snap_distance_mm": float(
             np.linalg.norm(target_center_after - target_center_before) * 1000.0
         ),
+        "attachment_offset_m": (
+            target_center_before - tip_position
+        ).tolist(),
     }
 
 
@@ -654,23 +727,35 @@ def _lift_and_verify(
     start = ik.current_pose()
     lifted = start.copy()
     lifted[:3, 3] += normal * float(lift_m)
+    lift_steps = max(1, int(SERVO_LIFT_STEPS))
+    lift_duration = max(0.0, float(SERVO_LIFT_DURATION_S))
     if kinematic_only:
-        for index in range(1, 31):
-            ratio = index / 30.0
+        for index in range(1, lift_steps + 1):
+            ratio = index / lift_steps
+            smooth_ratio = ratio * ratio * (3.0 - 2.0 * ratio)
             pose = start.copy()
-            pose[:3, 3] = (1.0 - ratio) * start[:3, 3] + ratio * lifted[:3, 3]
+            pose[:3, 3] = (
+                (1.0 - smooth_ratio) * start[:3, 3]
+                + smooth_ratio * lifted[:3, 3]
+            )
             ik.apply(pose)
-            time.sleep(1.0 / max(SERVO_RATE_HZ, 1.0) / 30.0)
+            time.sleep(lift_duration / lift_steps)
     else:
         client.setStepping(True)
         if sim.getSimulationState() in {sim.simulation_stopped, sim.simulation_paused}:
             sim.startSimulation()
-        for index in range(1, 31):
-            ratio = index / 30.0
+        for index in range(1, lift_steps + 1):
+            ratio = index / lift_steps
+            smooth_ratio = ratio * ratio * (3.0 - 2.0 * ratio)
             pose = start.copy()
-            pose[:3, 3] = (1.0 - ratio) * start[:3, 3] + ratio * lifted[:3, 3]
+            pose[:3, 3] = (
+                (1.0 - smooth_ratio) * start[:3, 3]
+                + smooth_ratio * lifted[:3, 3]
+            )
             ik.apply(pose)
             client.step()
+            if lift_duration > 0.0:
+                time.sleep(lift_duration / lift_steps)
         sim.pauseSimulation()
     expected = before + normal * float(lift_m)
     lifted_state = TargetTrackState(
@@ -764,7 +849,12 @@ def run_visual_servo(
             initial_euler_deg,
         )
         print("Moving to visual-servo pregrasp pose...")
-        current = ik.move_linear(initial_pose, SERVO_PREGRASP_STEPS, table_plane)
+        current = ik.move_linear(
+            initial_pose,
+            SERVO_PREGRASP_STEPS,
+            table_plane,
+            duration_s=SERVO_PREGRASP_DURATION_S,
+        )
         if execute_grasp and not (USE_CONNECTOR and CONNECTOR_KINEMATIC_ONLY):
             # Active second-view motion may leave the TCP only a few millimetres
             # above the clearance gate. First retreat to the high pregrasp,
@@ -797,7 +887,12 @@ def run_visual_servo(
             if observation is None:
                 raise RuntimeError("Open-loop residual measurement lost the target")
             last_observation = observation
-            state = update_track_state(state, observation)
+            state = update_track_state(
+                state,
+                observation,
+                center_alpha=SERVO_TRACK_CENTER_ALPHA,
+                max_center_update_m=SERVO_TRACK_MAX_UPDATE_M,
+            )
             desired = _target_grasp_pose(
                 state,
                 SERVO_PREGRASP_STANDOFF_M,
@@ -863,6 +958,24 @@ def run_visual_servo(
             phases = phases[:1]
         for phase_name, standoff, position_tol, orientation_tol in phases:
             print(f"\n--- Visual servo phase: {phase_name} ---")
+            phase_controller = PBVSController(
+                position_gain=1.2 if phase_name == "approach" else 1.4,
+                rotation_gain=0.9 if phase_name == "approach" else 1.1,
+                max_linear_speed_m_s=(
+                    SERVO_APPROACH_MAX_LINEAR_SPEED_M_S
+                    if phase_name == "approach"
+                    else SERVO_ALIGN_MAX_LINEAR_SPEED_M_S
+                ),
+                max_angular_speed_rad_s=math.radians(
+                    SERVO_MAX_ANGULAR_SPEED_DEG_S
+                ),
+                max_translation_step_m=(
+                    SERVO_APPROACH_MAX_TRANSLATION_STEP_M
+                    if phase_name == "approach"
+                    else SERVO_ALIGN_MAX_TRANSLATION_STEP_M
+                ),
+                max_rotation_step_rad=math.radians(SERVO_MAX_ROTATION_STEP_DEG),
+            )
             stable_count = 0
             for phase_iteration in range(max(1, int(max_iterations))):
                 total_iterations += 1
@@ -907,7 +1020,12 @@ def run_visual_servo(
 
                 lost_count = 0
                 last_observation = observation
-                state = update_track_state(state, observation)
+                state = update_track_state(
+                    state,
+                    observation,
+                    center_alpha=SERVO_TRACK_CENTER_ALPHA,
+                    max_center_update_m=SERVO_TRACK_MAX_UPDATE_M,
+                )
                 current = ik.current_pose()
                 desired = _target_grasp_pose(
                     state,
@@ -916,7 +1034,22 @@ def run_visual_servo(
                     table_plane[:3],
                     grasp_orientation,
                 )
-                command = controller.command(current, desired)
+                if phase_name == "approach":
+                    approach_error = phase_controller.pose_error(current, desired)
+                    slow_approach = (
+                        approach_error.position_norm_m <= SERVO_APPROACH_SLOW_ZONE_M
+                    )
+                    phase_controller.max_linear_speed_m_s = (
+                        SERVO_APPROACH_SLOW_LINEAR_SPEED_M_S
+                        if slow_approach
+                        else SERVO_APPROACH_MAX_LINEAR_SPEED_M_S
+                    )
+                    phase_controller.max_translation_step_m = (
+                        SERVO_APPROACH_SLOW_TRANSLATION_STEP_M
+                        if slow_approach
+                        else SERVO_APPROACH_MAX_TRANSLATION_STEP_M
+                    )
+                command = phase_controller.command(current, desired)
                 error = command.error
                 final_error = error
                 trace.append(
@@ -938,7 +1071,7 @@ def run_visual_servo(
                     f"points={observation.point_count}"
                 )
 
-                if controller.converged(error, position_tol, orientation_tol):
+                if phase_controller.converged(error, position_tol, orientation_tol):
                     stable_count += 1
                     if stable_count >= SERVO_STABLE_FRAMES:
                         break
@@ -948,7 +1081,7 @@ def run_visual_servo(
                     continue
                 else:
                     stable_count = 0
-                next_pose = controller.next_pose(current, command, dt)
+                next_pose = phase_controller.next_pose(current, command, dt)
                 if _table_signed_height(next_pose[:3, 3], table_plane) < SERVO_MIN_TCP_TABLE_CLEARANCE_M:
                     raise RuntimeError("PBVS command would violate table clearance")
                 current = ik.apply(next_pose)

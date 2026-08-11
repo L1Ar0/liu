@@ -14,6 +14,7 @@ from visual_servo_perception import (
     select_servo_target,
 )
 from ensure_simulation_stopped import is_grasp_connector_alias
+from visual_servo_runner import _attach_connector
 
 
 def test_top_down_grasp_pose_has_expected_height_and_axis():
@@ -124,3 +125,68 @@ def test_stale_connector_alias_recognizes_underscore_and_hyphen_names():
     assert is_grasp_connector_alias("grasp_connector_rand_cube_01")
     assert is_grasp_connector_alias("grasp-connector-rand-cube-01")
     assert not is_grasp_connector_alias("gripper_tip")
+
+
+def test_connector_attachment_preserves_object_world_position():
+    class FakeSim:
+        handle_scene = -1
+        sceneobject_shape = 1
+        shapeintparam_static = 2
+        shapeintparam_respondable = 3
+
+        def __init__(self):
+            self.positions = {
+                10: np.asarray([0.50, -0.02, 0.0225], dtype=np.float64),
+                20: np.asarray([0.50, -0.02, 0.0600], dtype=np.float64),
+            }
+            self.aliases = {10: "rand_sphere_01"}
+            self.parents = []
+            self.next_dummy = 30
+
+        def getObjectsInTree(self, *_args):
+            return [10]
+
+        def getObjectAlias(self, handle):
+            return self.aliases[int(handle)]
+
+        def getObjectPosition(self, handle, _relative):
+            return self.positions[int(handle)].tolist()
+
+        def getObjectPose(self, handle, _relative):
+            return [*self.positions[int(handle)].tolist(), 0.0, 0.0, 0.0, 1.0]
+
+        def setObjectInt32Param(self, *_args):
+            return None
+
+        def createDummy(self, _size):
+            handle = self.next_dummy
+            self.next_dummy += 1
+            self.positions[handle] = np.zeros(3, dtype=np.float64)
+            return handle
+
+        def setObjectAlias(self, handle, alias):
+            self.aliases[int(handle)] = str(alias)
+
+        def setObjectPose(self, handle, pose, _relative):
+            self.positions[int(handle)] = np.asarray(pose[:3], dtype=np.float64)
+
+        def setObjectParent(self, child, parent, keep_in_place):
+            assert keep_in_place is True
+            self.parents.append((int(child), int(parent)))
+
+    sim = FakeSim()
+    state = TargetTrackState(
+        object_id=0,
+        class_name="sphere",
+        center_base_m=np.asarray([0.50, -0.02, 0.0225]),
+        rotation_base=np.eye(3),
+        dimensions_m=np.asarray([0.045, 0.045, 0.045]),
+        confidence=0.8,
+    )
+    before = sim.positions[10].copy()
+    result = _attach_connector(sim, robot_base=1, tip=20, target_state=state)
+    np.testing.assert_allclose(sim.positions[10], before, atol=1e-12)
+    assert result["center_snapped_to_tip"] is False
+    assert result["relative_attachment_preserved"] is True
+    assert result["snap_distance_mm"] < 1e-9
+    assert (10, result["connector_handle"]) in sim.parents
