@@ -88,6 +88,31 @@ class PrimitiveFittingTests(unittest.TestCase):
         result = fit_primitive_candidates(np.vstack(faces))
         self.assertEqual(result["class"], "cube")
 
+    def test_occluded_cube_top_patch_uses_partial_planar_catalog_match(self) -> None:
+        grid = np.linspace(-0.019, 0.019, 14)
+        top = np.asarray(
+            [(x, y, 0.04) for x in grid for y in grid],
+            dtype=np.float64,
+        )
+        # Simulate points from a tilted contacting part crossing above the
+        # visible top face.  The whole cluster is not planar, but the dominant
+        # rectangular patch still identifies the finite-catalog cube.
+        overhang = np.column_stack(
+            [
+                self.rng.uniform(0.010, 0.030, 90),
+                self.rng.uniform(-0.018, 0.018, 90),
+                self.rng.uniform(0.043, 0.064, 90),
+            ]
+        )
+        result = fit_primitive_candidates(np.vstack([top, overhang]), top_k=6)
+        self.assertEqual(result["class"], "cube")
+        self.assertTrue(result["features"]["partial_planar_observation"])
+        candidate_scores = {
+            str(item["class"]): float(item["score"])
+            for item in result["candidates"]
+        }
+        self.assertEqual(candidate_scores["sphere"], 0.0)
+
 
 class ExchangeContractTests(unittest.TestCase):
     def test_cad_dimensions_exist(self) -> None:

@@ -21,6 +21,10 @@ EPS = 1e-9
 PLANAR_EIGENVALUE_RATIO_MAX = 0.012
 PLANAR_THICKNESS_RATIO_MAX = 0.060
 PLANAR_SHAPE_MARGIN = 0.10
+PARTIAL_PLANAR_MIN_POINTS = 40
+PARTIAL_PLANAR_MIN_FRACTION = 0.30
+PARTIAL_PLANAR_MAX_THICKNESS_M = 0.0045
+PARTIAL_PLANAR_MAX_ASPECT_RATIO = 1.35
 
 
 @dataclass
@@ -185,6 +189,155 @@ def _rectangle_boundary_error(points: np.ndarray, vertices: np.ndarray) -> tuple
     return best_error, best_area
 
 
+def _planar_patch_metrics(points: np.ndarray, normal: np.ndarray) -> dict[str, object]:
+    """Measure the footprint of a locally planar subset of a cluster."""
+
+    points = np.asarray(points, dtype=np.float64)
+    normal = _normalize(np.asarray(normal, dtype=np.float64))
+    center = points.mean(axis=0)
+    centered = points - center
+    # Use the dominant in-plane direction, then construct a stable right-handed
+    # basis.  This avoids treating a partial top face as a 3-D OBB.
+    covariance = np.cov(centered.T) if len(points) >= 3 else np.eye(3)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    in_plane = eigenvectors[:, int(np.argmax(eigenvalues))]
+    in_plane -= float(np.dot(in_plane, normal)) * normal
+    if float(np.linalg.norm(in_plane)) < 1e-7:
+        reference = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+        if abs(float(np.dot(reference, normal))) > 0.9:
+            reference = np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
+        in_plane = reference - float(np.dot(reference, normal)) * normal
+    in_plane = _normalize(in_plane)
+    other = _normalize(np.cross(normal, in_plane))
+    uv = np.column_stack([centered @ in_plane, centered @ other])
+    low = np.percentile(uv, 1.0, axis=0)
+    high = np.percentile(uv, 99.0, axis=0)
+    extent = np.sort(np.maximum(high - low, EPS))[::-1]
+    circularity = 0.0
+    rectangularity = 0.0
+    circle_boundary_error = 1.0
+    rectangle_boundary_error = 1.0
+    boundary_point_count = 0
+    if len(uv) >= 4:
+        try:
+            hull = ConvexHull(uv)
+            vertices = uv[np.asarray(hull.vertices, dtype=int)]
+            perimeter = float(
+                np.sum(np.linalg.norm(np.roll(vertices, -1, axis=0) - vertices, axis=1))
+            )
+            area = float(hull.volume)
+            circularity = float(
+                np.clip(4.0 * math.pi * area / max(perimeter * perimeter, EPS), 0.0, 1.0)
+            )
+            boundary_distance = _point_to_polygon_edges(uv, vertices)
+            tolerance = max(0.0015, 0.055 * float(np.min(extent)))
+            boundary = uv[boundary_distance <= tolerance]
+            boundary_point_count = int(len(boundary))
+            if len(boundary) >= 5:
+                circle_boundary_error = _circle_boundary_error(boundary)
+                rectangle_boundary_error, rectangle_area = _rectangle_boundary_error(
+                    boundary,
+                    vertices,
+                )
+                rectangularity = float(
+                    np.clip(area / max(rectangle_area, EPS), 0.0, 1.0)
+                )
+            else:
+                rectangularity = float(
+                    np.clip(area / max(float(np.prod(extent)), EPS), 0.0, 1.0)
+                )
+        except QhullError:
+            pass
+    return {
+        "center": center,
+        "normal": normal,
+        "extent": extent,
+        "circularity": circularity,
+        "rectangularity": rectangularity,
+        "circle_boundary_error": circle_boundary_error,
+        "rectangle_boundary_error": rectangle_boundary_error,
+        "boundary_point_count": boundary_point_count,
+        "point_count": int(len(points)),
+    }
+
+
+def _dominant_planar_patch(points: np.ndarray, box: dict) -> dict[str, object] | None:
+    """Find a dense, thin planar patch inside a contact/occlusion cluster.
+
+    A merged cube + tilted cuboid often contains a large horizontal cube top
+    face while the complete cluster is not planar.  Searching a small set of
+    PCA/world directions lets the closed-set recognizer use that face without
+    relying on simulator colors or object IDs.
+    """
+
+    points = np.asarray(points, dtype=np.float64)
+    if len(points) < PARTIAL_PLANAR_MIN_POINTS:
+        return None
+    directions: list[np.ndarray] = []
+    for direction in [
+        *np.asarray(box["rotation"], dtype=np.float64).T,
+        np.asarray([1.0, 0.0, 0.0]),
+        np.asarray([0.0, 1.0, 0.0]),
+        np.asarray([0.0, 0.0, 1.0]),
+    ]:
+        direction = _normalize(direction)
+        if not any(abs(float(np.dot(direction, other))) > 0.995 for other in directions):
+            directions.append(direction)
+
+    best: dict[str, object] | None = None
+    for direction in directions:
+        values = points @ direction
+        low, high = np.percentile(values, [1.0, 99.0])
+        span = float(high - low)
+        if span < 0.002:
+            continue
+        bin_count = int(np.clip(math.ceil(span / 0.0025), 8, 32))
+        counts, edges = np.histogram(values, bins=bin_count, range=(low, high))
+        for index in np.argsort(counts)[::-1][:3]:
+            if int(counts[index]) < PARTIAL_PLANAR_MIN_POINTS:
+                continue
+            band_center = 0.5 * float(edges[index] + edges[index + 1])
+            tolerance = max(0.0012, 0.40 * float(edges[index + 1] - edges[index]))
+            mask = np.abs(values - band_center) <= tolerance
+            patch = points[mask]
+            fraction = float(len(patch) / max(len(points), 1))
+            if len(patch) < PARTIAL_PLANAR_MIN_POINTS or fraction < PARTIAL_PLANAR_MIN_FRACTION:
+                continue
+            patch_center = patch.mean(axis=0)
+            patch_covariance = np.cov((patch - patch_center).T)
+            patch_eigenvalues, patch_eigenvectors = np.linalg.eigh(patch_covariance)
+            patch_normal = _normalize(patch_eigenvectors[:, int(np.argmin(patch_eigenvalues))])
+            thickness = float(
+                np.percentile(
+                    np.abs((patch - patch_center) @ patch_normal),
+                    99.0,
+                )
+            )
+            if thickness > PARTIAL_PLANAR_MAX_THICKNESS_M:
+                continue
+            metrics = _planar_patch_metrics(patch, patch_normal)
+            extent = np.asarray(metrics["extent"], dtype=np.float64)
+            aspect_ratio = float(extent[0] / max(extent[1], EPS))
+            if aspect_ratio > PARTIAL_PLANAR_MAX_ASPECT_RATIO:
+                continue
+            rectangularity = float(metrics["rectangularity"])
+            rectangle_error = float(metrics["rectangle_boundary_error"])
+            score = fraction * (0.45 + 0.55 * rectangularity) * math.exp(
+                -rectangle_error / 0.12
+            )
+            candidate = {
+                **metrics,
+                "is_partial": True,
+                "support_fraction": fraction,
+                "thickness_m": thickness,
+                "aspect_ratio": aspect_ratio,
+                "score": float(score),
+            }
+            if best is None or float(candidate["score"]) > float(best["score"]):
+                best = candidate
+    return best
+
+
 def _planar_descriptors(points: np.ndarray, box: dict) -> dict[str, object]:
     """Describe a thin observed surface in its local plane."""
 
@@ -243,9 +396,41 @@ def _planar_descriptors(points: np.ndarray, box: dict) -> dict[str, object]:
         except QhullError:
             pass
 
+    partial = _dominant_planar_patch(points, box)
+    partial_valid = bool(
+        partial is not None
+        and float(partial["rectangularity"]) >= 0.78
+        and float(partial["rectangle_boundary_error"]) <= 0.16
+    )
+    if partial_valid:
+        # A dominant patch is a stronger geometric observation than the OBB of
+        # an occluded/merged cluster.  Expose its footprint to the catalog
+        # scorer while retaining explicit partial-observation diagnostics.
+        normal = np.asarray(partial["normal"], dtype=np.float64)
+        planar_center = np.asarray(partial["center"], dtype=np.float64)
+        plane_extent = np.asarray(partial["extent"], dtype=np.float64)
+        circularity = float(partial["circularity"])
+        rectangularity = float(partial["rectangularity"])
+        circle_boundary_error = float(partial["circle_boundary_error"])
+        rectangle_boundary_error = float(partial["rectangle_boundary_error"])
+        boundary_point_count = int(partial["boundary_point_count"])
+    else:
+        normal = rotation[:, 2].copy()
+        planar_center = center.copy()
+
     return {
-        "is_planar": is_planar,
-        "normal": rotation[:, 2].copy(),
+        "is_planar": bool(is_planar or partial_valid),
+        "partial_planar_observation": bool(partial_valid),
+        "partial_planar_center": planar_center.tolist(),
+        "partial_planar_normal": normal.tolist(),
+        "partial_planar_extent": plane_extent.tolist(),
+        "partial_planar_support_fraction": float(
+            partial["support_fraction"] if partial is not None else 0.0
+        ),
+        "partial_planar_thickness_m": float(
+            partial["thickness_m"] if partial is not None else 0.0
+        ),
+        "normal": normal,
         "extent": plane_extent,
         "eigenvalue_ratio": eigenvalue_ratio,
         "thickness_ratio": thickness_ratio,
@@ -408,6 +593,100 @@ def fit_cone(points: np.ndarray) -> AxisFit:
     return best
 
 
+def _axial_radius_profile(
+    points: np.ndarray,
+    axis: np.ndarray,
+    center: np.ndarray,
+    bin_count: int = 8,
+) -> dict[str, float]:
+    """Compare constant-radius and linearly tapered axial profiles.
+
+    Raw point-to-surface residuals are easily biased by missing caps and
+    self-occlusion.  Median radius in height slices is substantially more
+    stable: cylinders remain flat while cones change monotonically along the
+    symmetry axis.
+    """
+
+    points = np.asarray(points, dtype=np.float64)
+    axis = _normalize(np.asarray(axis, dtype=np.float64))
+    center = np.asarray(center, dtype=np.float64)
+    relative = points - center
+    axial = relative @ axis
+    radial_vectors = relative - axial[:, None] * axis
+    radii = np.linalg.norm(radial_vectors, axis=1)
+    low, high = np.percentile(axial, [2.0, 98.0])
+    span = float(high - low)
+    if span < 0.006:
+        return {
+            "valid_bin_fraction": 0.0,
+            "slope_strength": 0.0,
+            "line_r2": 0.0,
+            "line_advantage": 0.0,
+            "monotonicity": 0.0,
+            "constant_error": 1.0,
+            "linear_error": 1.0,
+        }
+
+    edges = np.linspace(low, high, max(5, int(bin_count)) + 1)
+    centers: list[float] = []
+    medians: list[float] = []
+    minimum_points = max(6, int(0.012 * len(points)))
+    for first, second in zip(edges[:-1], edges[1:]):
+        mask = (axial >= first) & (axial <= second)
+        if int(mask.sum()) < minimum_points:
+            continue
+        centers.append(0.5 * float(first + second))
+        medians.append(float(np.median(radii[mask])))
+    if len(centers) < 4:
+        return {
+            "valid_bin_fraction": float(len(centers) / max(len(edges) - 1, 1)),
+            "slope_strength": 0.0,
+            "line_r2": 0.0,
+            "line_advantage": 0.0,
+            "monotonicity": 0.0,
+            "constant_error": 1.0,
+            "linear_error": 1.0,
+        }
+
+    x = np.asarray(centers, dtype=np.float64)
+    y = np.asarray(medians, dtype=np.float64)
+    design = np.column_stack([x, np.ones_like(x)])
+    slope, intercept = np.linalg.lstsq(design, y, rcond=None)[0]
+    predicted = slope * x + intercept
+    constant = np.full_like(y, float(np.median(y)))
+    scale = max(float(np.mean(y)), EPS)
+    linear_error = float(np.sqrt(np.mean((y - predicted) ** 2)) / scale)
+    constant_error = float(np.sqrt(np.mean((y - constant) ** 2)) / scale)
+    total_variation = float(np.sum((y - np.mean(y)) ** 2))
+    residual_variation = float(np.sum((y - predicted) ** 2))
+    line_r2 = float(
+        np.clip(1.0 - residual_variation / max(total_variation, EPS), 0.0, 1.0)
+    )
+    x_centered = x - float(np.mean(x))
+    y_centered = y - float(np.mean(y))
+    denominator = float(np.linalg.norm(x_centered) * np.linalg.norm(y_centered))
+    correlation = (
+        float(np.dot(x_centered, y_centered) / denominator)
+        if len(x) >= 3 and denominator > EPS
+        else 0.0
+    )
+    return {
+        "valid_bin_fraction": float(len(x) / max(len(edges) - 1, 1)),
+        "slope_strength": float(abs(slope) * span / scale),
+        "line_r2": line_r2,
+        "line_advantage": float(
+            np.clip(
+                (constant_error - linear_error) / max(constant_error, EPS),
+                0.0,
+                1.0,
+            )
+        ),
+        "monotonicity": float(np.clip(abs(correlation), 0.0, 1.0)),
+        "constant_error": constant_error,
+        "linear_error": linear_error,
+    }
+
+
 def axis_rotation(axis: np.ndarray, reference_rotation: np.ndarray) -> np.ndarray:
     z_axis = _normalize(axis)
     reference = reference_rotation[:, 0]
@@ -548,6 +827,8 @@ def fit_primitive_candidates(
     sphere = fit_sphere(points)
     cylinder = fit_cylinder(points)
     cone = fit_cone(points)
+    cylinder_profile = _axial_radius_profile(points, cylinder.axis, cylinder.center)
+    cone_profile = _axial_radius_profile(points, cone.axis, cone.center)
     surface = _surface_descriptors(points, box, sphere, cylinder, cone)
     planar = _planar_descriptors(points, box)
 
@@ -565,6 +846,10 @@ def fit_primitive_candidates(
     cuboid_score = box_score * (0.20 + 0.80 * (1.0 - cube_shape_score))
     sphere_score = _exp_score(float(sphere["residual"]), 0.055)
     sphere_score *= 0.75 + 0.25 * surface["sphere_radial_normal_alignment"]
+    sphere_directional_coverage = float(
+        np.clip(float(sphere["coverage"]) / (1.0 / 27.0), 0.0, 1.0)
+    )
+    sphere_score *= 0.55 + 0.45 * math.sqrt(sphere_directional_coverage)
     # A spheroid can have only a modest axis ratio; do not require the very
     # elongated OBB that a partially visible sphere often produces.
     spheroid_anisotropy = float(np.clip((cube_ratio - 1.05) / 0.30, 0.0, 1.0))
@@ -593,6 +878,12 @@ def fit_primitive_candidates(
     )
     cone_score *= 0.80 + 0.20 * surface["cone_surface_normal_alignment"]
     cone_score *= 0.65 + 0.35 * cross_section_similarity
+    cone_profile_evidence = (
+        float(cone_profile["valid_bin_fraction"])
+        * float(cone_profile["line_r2"])
+        * float(cone_profile["monotonicity"])
+    )
+    cone_score *= 0.72 + 0.28 * cone_profile_evidence
 
     dimension_scores = {
         class_name: _catalog_dimension_score(
@@ -746,15 +1037,60 @@ def fit_primitive_candidates(
             "obb_extent_m": extent.tolist(),
             "box_surface_error": float(box["surface_error"]),
             "sphere_fit_error": float(sphere["residual"]),
+            "sphere_directional_coverage": sphere_directional_coverage,
             "spheroid_fit_error": float(ellipsoid_error),
             "cylinder_fit_error": float(cylinder.residual),
             "cylinder_slope_strength": float(cylinder_slope_strength),
+            "cylinder_profile_valid_bin_fraction": float(
+                cylinder_profile["valid_bin_fraction"]
+            ),
+            "cylinder_profile_slope_strength": float(
+                cylinder_profile["slope_strength"]
+            ),
+            "cylinder_profile_line_r2": float(cylinder_profile["line_r2"]),
+            "cylinder_profile_line_advantage": float(
+                cylinder_profile["line_advantage"]
+            ),
             "cone_fit_error": float(cone.residual),
             "cone_slope_strength": float(cone_slope_strength),
+            "cone_profile_valid_bin_fraction": float(
+                cone_profile["valid_bin_fraction"]
+            ),
+            "cone_profile_slope_strength": float(cone_profile["slope_strength"]),
+            "cone_profile_line_r2": float(cone_profile["line_r2"]),
+            "cone_profile_line_advantage": float(cone_profile["line_advantage"]),
+            "cone_profile_monotonicity": float(cone_profile["monotonicity"]),
+            "cone_profile_constant_error": float(cone_profile["constant_error"]),
+            "cone_profile_linear_error": float(cone_profile["linear_error"]),
+            "cone_taper_ratio": float(
+                1.0
+                - min(cone.top_radius, cone.base_radius)
+                / max(max(cone.top_radius, cone.base_radius), EPS)
+            ),
+            "cone_catalog_base_radius_error": float(
+                abs(
+                    max(cone.top_radius, cone.base_radius)
+                    - 0.5 * get_cad_dimensions(get_shape_spec("cone").cad_id)[0]
+                )
+                / max(0.5 * get_cad_dimensions(get_shape_spec("cone").cad_id)[0], EPS)
+            ),
             "axisymmetric_cross_section_score": float(cross_section_similarity),
             "catalog_dimension_scores": dimension_scores,
             "catalog_locked": bool(catalog_locked),
             "planar_observation": bool(planar["is_planar"]),
+            "partial_planar_observation": bool(
+                planar.get("partial_planar_observation", False)
+            ),
+            "partial_planar_center_m": np.asarray(
+                planar.get("partial_planar_center", box["center"]),
+                dtype=float,
+            ).tolist(),
+            "partial_planar_support_fraction": float(
+                planar.get("partial_planar_support_fraction", 0.0)
+            ),
+            "partial_planar_thickness_m": float(
+                planar.get("partial_planar_thickness_m", 0.0)
+            ),
             "planar_normal": np.asarray(planar["normal"], dtype=float).tolist(),
             "planar_extent_m": np.asarray(planar["extent"], dtype=float).tolist(),
             "planar_eigenvalue_ratio": float(planar["eigenvalue_ratio"]),

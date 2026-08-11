@@ -91,7 +91,24 @@ def _complete_planar_pose(
         return center, rotation, warnings
     table_normal /= normal_norm
     plane_offset = float(table_plane[3]) / normal_norm
-    visible_normal = rotation[:, 2]
+    feature_normal = np.asarray(
+        fit.get("features", {}).get("planar_normal", rotation[:, 2]),
+        dtype=np.float64,
+    )
+    partial_planar = bool(
+        fit.get("features", {}).get("partial_planar_observation", False)
+    )
+    if partial_planar:
+        # The whole merged cluster can have an unstable OBB.  Use the
+        # dominant planar patch for the support normal, then keep the catalog
+        # pose frame deterministic around the table normal.
+        center = np.asarray(
+            fit.get("features", {}).get("partial_planar_center_m", center),
+            dtype=np.float64,
+        ).copy()
+        rotation = _table_frame(rotation, table_normal)
+        feature_normal = np.asarray(rotation[:, 2], dtype=np.float64)
+    visible_normal = feature_normal
     alignment = abs(float(np.dot(visible_normal, table_normal)))
     if alignment < 0.75:
         warnings.append("planar_side_face_pose_ambiguous")
@@ -111,7 +128,12 @@ def _complete_planar_pose(
     vertical_half_extent = float(
         np.sum(np.abs(table_normal @ rotation) * (0.5 * dimensions))
     )
-    observed_surface_height = float(np.median(np.asarray(points) @ table_normal + plane_offset))
+    if partial_planar:
+        observed_surface_height = float(np.dot(center, table_normal) + plane_offset)
+    else:
+        observed_surface_height = float(
+            np.median(np.asarray(points) @ table_normal + plane_offset)
+        )
     current_height = float(np.dot(center, table_normal) + plane_offset)
     target_height = observed_surface_height - vertical_half_extent
     center += table_normal * (target_height - current_height)
@@ -406,6 +428,27 @@ def _resolve_closed_set_ambiguity(
     cone_normal_alignment = float(
         fit.get("features", {}).get("cone_surface_normal_alignment", 0.0)
     )
+    cone_profile_valid = float(
+        fit.get("features", {}).get("cone_profile_valid_bin_fraction", 0.0)
+    )
+    cone_profile_slope = float(
+        fit.get("features", {}).get("cone_profile_slope_strength", 0.0)
+    )
+    cone_profile_r2 = float(
+        fit.get("features", {}).get("cone_profile_line_r2", 0.0)
+    )
+    cone_profile_advantage = float(
+        fit.get("features", {}).get("cone_profile_line_advantage", 0.0)
+    )
+    cone_profile_monotonicity = float(
+        fit.get("features", {}).get("cone_profile_monotonicity", 0.0)
+    )
+    cone_taper_ratio = float(
+        fit.get("features", {}).get("cone_taper_ratio", 0.0)
+    )
+    cone_base_radius_error = float(
+        fit.get("features", {}).get("cone_catalog_base_radius_error", 1.0)
+    )
     top_height = float(np.percentile(heights, 99.0))
 
     # For a table-supported upright object, the highest visible point is a
@@ -512,9 +555,16 @@ def _resolve_closed_set_ambiguity(
 
     if (
         selected == "cylinder"
-        and cone_slope_strength >= 0.55
-        and cone_normal_alignment >= 0.80
-        and cone_fit_error <= 0.90 * max(cylinder_fit_error, 1e-9)
+        and cone_slope_strength >= 0.75
+        and cone_normal_alignment >= 0.90
+        and cone_profile_valid >= 0.75
+        and cone_profile_slope >= 0.50
+        and cone_profile_r2 >= 0.80
+        and cone_profile_advantage >= 0.20
+        and cone_profile_monotonicity >= 0.80
+        and cone_taper_ratio >= 0.55
+        and cone_base_radius_error <= 0.45
+        and cone_fit_error <= 1.12 * max(cylinder_fit_error, 1e-9)
         and float(candidates.get("cone", 0.0)) >= 0.10
     ):
         fit = dict(fit)
