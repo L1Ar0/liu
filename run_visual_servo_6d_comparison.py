@@ -30,6 +30,8 @@ def _run(command: list[str], env: dict[str, str], log_path: Path) -> None:
         cwd=ROOT,
         env=env,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
