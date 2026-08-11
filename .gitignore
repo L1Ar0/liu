@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Runtime artifacts. Keep benchmark summaries and selected reports explicitly
+# with git add when they are useful evidence.
+camera_output/*
+segmentation_output/*.ply
+segmentation_output/*.json
+recognition_output/*.json
+evaluation_output/*.csv
+evaluation_output/*.json
+visual_servo_output/*.csv
+visual_servo_output/*.json
+random_scene_ground_truth.json
+random_scene_contacts.json
+depth_grasp_dataset.npz
+depth_grasp_dataset.json
+depth_grasp_rl_output/
+complex_benchmark_output/
+visual_servo_6d_output/
+
+# Review-only external source copies, not part of the project.
+.codex_review/

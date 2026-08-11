@@ -1,0 +1,5 @@
+# Optional depth-to-6D PPO extension. The geometry/PBVS pipeline does not
+# require these packages.
+torch>=2.3
+matplotlib>=3.8
+pytest>=8.0
