@@ -1,166 +1,175 @@
-"""Train the optional depth-to-6D contextual-bandit PPO policy."""
+"""Train the end-to-end depth/proprioception grasp policy with PPO.
+
+This entry point performs real multi-step rollouts in CoppeliaSim through the
+Gymnasium environment.  It does not load offline labels or compute a bandit
+geometry error.
+"""
 
 from __future__ import annotations
 
 import argparse
-import csv
+import importlib.util
 import json
+import os
 from pathlib import Path
-from typing import Any
-
-import numpy as np
-
-from depth_grasp_rl import (
-    ACTION_DIM,
-    DepthGraspActorCritic,
-    action_reward,
-    make_state_tensor,
-    require_torch,
-)
-
-
-def _metrics(actions: np.ndarray, targets: np.ndarray) -> dict[str, float]:
-    values = [action_reward(action, target) for action, target in zip(actions, targets)]
-    rewards = [item[0] for item in values]
-    successes = [item[1] for item in values]
-    return {
-        "reward": float(np.mean(rewards)),
-        "success_percent": 100.0 * float(np.mean(successes)),
-        "position_error": float(np.mean([item[2]["position_error"] for item in values])),
-        "yaw_error_deg": float(np.degrees(np.mean([item[2]["yaw_error_rad"] for item in values]))),
-        "normal_error_deg": float(np.degrees(np.mean([item[2]["normal_error_rad"] for item in values]))),
-    }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", type=Path, required=True)
-    parser.add_argument("--episodes", type=int, default=10000)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--ppo-epochs", type=int, default=4)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--clip-ratio", type=float, default=0.2)
+    parser.add_argument("--timesteps", type=int, default=1_000_000)
+    parser.add_argument("--n-envs", type=int, default=1)
+    parser.add_argument("--max-steps", type=int, default=80)
+    parser.add_argument("--sim-steps-per-action", type=int, default=4)
+    parser.add_argument("--scene-mode", default="physics", choices=("physics", "planned", "separated", "level4"))
+    parser.add_argument("--planned-layout", default="auto")
+    parser.add_argument(
+        "--execution-mode",
+        default="settle_then_kinematic",
+        choices=("kinematic", "settle_then_kinematic", "dynamic"),
+        help="RL execution: freeze after physics reset (default), pure kinematic, or experimental dynamic rollout",
+    )
     parser.add_argument("--seed", type=int, default=20260811)
-    parser.add_argument("--output-dir", type=Path, default=Path("depth_grasp_rl_output"))
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--n-steps", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--output-dir", type=Path, default=Path("end_to_end_grasp_rl_output"))
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--checkpoint-freq", type=int, default=100_000)
+    parser.add_argument("--curriculum", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--tensorboard",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable TensorBoard logging when the optional tensorboard package is installed",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if args.episodes <= 0:
-        raise SystemExit("--episodes must be positive")
-    torch = require_torch()
-    torch.manual_seed(int(args.seed))
-    np.random.seed(int(args.seed))
-    data = np.load(args.dataset, allow_pickle=False)
-    states = np.asarray(data["states"], dtype=np.float32)
-    targets = np.asarray(data["actions"], dtype=np.float32)
-    if len(states) != len(targets) or len(states) < 4:
-        raise RuntimeError("Dataset must contain matching states/actions and at least 4 samples")
-    permutation = np.random.default_rng(args.seed).permutation(len(states))
-    split = max(1, int(0.75 * len(states)))
-    train_idx, val_idx = permutation[:split], permutation[split:]
-    train_states = make_state_tensor(states[train_idx], args.device)
-    train_targets = targets[train_idx]
-    val_states = make_state_tensor(states[val_idx], args.device)
-    val_targets = targets[val_idx]
+    if args.timesteps <= 0 or args.n_envs <= 0:
+        raise SystemExit("--timesteps and --n-envs must be positive")
+    if args.n_envs != 1:
+        raise SystemExit(
+            "CoppeliaSim environment currently supports one live simulator per training process; "
+            "use --n-envs 1 or launch separate simulator instances."
+        )
+    try:
+        from stable_baselines3 import PPO
+        from stable_baselines3.common.callbacks import CheckpointCallback
+        from stable_baselines3.common.callbacks import BaseCallback
+        from stable_baselines3.common.monitor import Monitor
+        from stable_baselines3.common.vec_env import DummyVecEnv
+        from end_to_end_grasp_env import EndToEndGraspEnv
+        from depth_grasp_rl import DepthProprioFeaturesExtractor
+    except ImportError as exc:
+        raise SystemExit(
+            "End-to-end PPO requires Gymnasium, Stable-Baselines3, PyTorch and "
+            "the CoppeliaSim ZMQ client. Install requirements-rl.txt."
+        ) from exc
+    if DepthProprioFeaturesExtractor is None:
+        raise SystemExit("DepthProprioFeaturesExtractor is unavailable; install stable-baselines3 and torch.")
 
-    model = DepthGraspActorCritic(ACTION_DIM).to(args.device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(args.learning_rate))
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = output_dir / "metrics.csv"
-    metrics_file = metrics_path.open("w", newline="", encoding="utf-8")
-    writer = csv.DictWriter(
-        metrics_file,
-        fieldnames=["episode", "train_reward", "train_success_percent", "val_reward", "val_success_percent", "policy_loss", "value_loss"],
-    )
-    writer.writeheader()
-    best_success = -1.0
-    best_episode = 0
-    rng = np.random.default_rng(args.seed)
-    for episode in range(1, int(args.episodes) + 1):
-        batch_indices = rng.integers(0, len(train_idx), size=max(1, int(args.batch_size)))
-        state_batch = train_states[torch.as_tensor(batch_indices, dtype=torch.long, device=args.device)]
-        target_batch = train_targets[batch_indices]
-        with torch.no_grad():
-            distribution = model.distribution(state_batch)
-            sampled = distribution.sample()
-            old_log_prob = distribution.log_prob(sampled).sum(dim=-1)
-            _, _, values = model(state_batch)
-        sampled_np = sampled.detach().cpu().numpy()
-        rewards_np = np.asarray([action_reward(action, target)[0] for action, target in zip(sampled_np, target_batch)], dtype=np.float32)
-        rewards = torch.as_tensor(rewards_np, dtype=torch.float32, device=args.device)
-        advantages = rewards - values.detach()
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-6)
+    os.environ["ROBOT_GRASP_HEADLESS"] = "1"
 
-        policy_loss_value = torch.tensor(0.0, device=args.device)
-        value_loss_value = torch.tensor(0.0, device=args.device)
-        for _ in range(max(1, int(args.ppo_epochs))):
-            distribution = model.distribution(state_batch)
-            log_prob = distribution.log_prob(sampled).sum(dim=-1)
-            ratio = (log_prob - old_log_prob).exp()
-            clipped_ratio = ratio.clamp(1.0 - args.clip_ratio, 1.0 + args.clip_ratio)
-            policy_loss = -(torch.minimum(ratio * advantages, clipped_ratio * advantages)).mean()
-            _, _, current_values = model(state_batch)
-            value_loss = 0.5 * (current_values - rewards).pow(2).mean()
-            entropy = distribution.entropy().sum(dim=-1).mean()
-            loss = policy_loss + value_loss - 0.01 * entropy
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            policy_loss_value = policy_loss.detach()
-            value_loss_value = value_loss.detach()
+    def make_env(rank: int):
+        def _factory():
+            env = EndToEndGraspEnv(
+                scene_mode=args.scene_mode,
+                planned_layout=args.planned_layout if args.planned_layout != "auto" else None,
+                max_steps=args.max_steps,
+                sim_steps_per_action=args.sim_steps_per_action,
+                seed=int(args.seed) + rank * 104729,
+                headless=True,
+                curriculum_stage="A" if args.curriculum else "E",
+                execution_mode=args.execution_mode,
+            )
+            return Monitor(env)
+        return _factory
 
-        with torch.no_grad():
-            val_mean, _, _ = model(val_states)
-        train_metrics = _metrics(sampled_np, train_targets[batch_indices])
-        val_metrics = _metrics(val_mean.cpu().numpy(), val_targets)
-        row = {
-            "episode": episode,
-            "train_reward": train_metrics["reward"],
-            "train_success_percent": train_metrics["success_percent"],
-            "val_reward": val_metrics["reward"],
-            "val_success_percent": val_metrics["success_percent"],
-            "policy_loss": float(policy_loss_value.cpu()),
-            "value_loss": float(value_loss_value.cpu()),
-        }
-        writer.writerow(row)
-        if val_metrics["success_percent"] > best_success:
-            best_success = val_metrics["success_percent"]
-            best_episode = episode
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "action_dim": ACTION_DIM,
-                    "state_size": int(states.shape[-1]),
-                    "episode": episode,
-                    "validation": val_metrics,
-                    "seed": args.seed,
-                },
-                output_dir / "best_checkpoint.pt",
-            )
-        if episode == 1 or episode % max(1, args.episodes // 20) == 0:
-            print(
-                f"episode={episode} train_reward={train_metrics['reward']:.3f} "
-                f"val_success={val_metrics['success_percent']:.1f}%"
-            )
-    metrics_file.close()
-    summary = {
-        "episodes": int(args.episodes),
-        "train_count": int(len(train_idx)),
-        "validation_count": int(len(val_idx)),
-        "best_episode": int(best_episode),
-        "best_validation_success_percent": float(best_success),
-        "seed": int(args.seed),
-        "uses_color_features": False,
-        "policy": "DepthGraspActorCritic_PPO_contextual_bandit",
+    env = DummyVecEnv([make_env(index) for index in range(args.n_envs)])
+    policy_kwargs = {
+        "features_extractor_class": DepthProprioFeaturesExtractor,
+        "features_extractor_kwargs": {"features_dim": 256},
+        "net_arch": {"pi": [256, 128], "vf": [256, 128]},
     }
-    (output_dir / "training_summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    checkpoint_callback = CheckpointCallback(
+        save_freq=max(1, int(args.checkpoint_freq) // max(args.n_envs, 1)),
+        save_path=str(output_dir / "checkpoints"),
+        name_prefix="ppo_grasp",
+        save_replay_buffer=False,
+        save_vecnormalize=False,
     )
+
+    class CurriculumCallback(BaseCallback):
+        def __init__(self, total_timesteps: int) -> None:
+            super().__init__()
+            self.total_timesteps = max(1, int(total_timesteps))
+            self.current_stage = "A"
+
+        def _on_step(self) -> bool:
+            progress = float(self.num_timesteps) / self.total_timesteps
+            stage = "A" if progress < 0.15 else "B" if progress < 0.35 else "C" if progress < 0.55 else "D" if progress < 0.75 else "E"
+            if stage != self.current_stage:
+                self.training_env.env_method("set_curriculum_stage", stage)
+                self.current_stage = stage
+                print(f"Curriculum stage -> {stage}")
+            return True
+
+    callbacks = [checkpoint_callback]
+    if args.curriculum:
+        callbacks.append(CurriculumCallback(args.timesteps))
+    tensorboard_log = None
+    if args.tensorboard:
+        if importlib.util.find_spec("tensorboard") is not None:
+            tensorboard_log = str(output_dir / "tensorboard")
+        else:
+            print(
+                "TensorBoard 未安装，自动关闭日志；如需曲线请安装 "
+                "'.venv\\Scripts\\python.exe -m pip install tensorboard'。",
+                flush=True,
+            )
+    model = PPO(
+        "MultiInputPolicy",
+        env,
+        policy_kwargs=policy_kwargs,
+        learning_rate=float(args.learning_rate),
+        n_steps=int(args.n_steps),
+        batch_size=int(args.batch_size),
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.005,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        tensorboard_log=tensorboard_log,
+        seed=int(args.seed),
+        device=args.device,
+        verbose=1,
+    )
+    model.learn(total_timesteps=int(args.timesteps), callback=callbacks, progress_bar=False)
+    model.save(str(output_dir / "ppo_grasp_final"))
+    summary = {
+        "algorithm": "stable_baselines3.PPO",
+        "environment": "EndToEndGraspEnv",
+        "timesteps": int(args.timesteps),
+        "n_envs": int(args.n_envs),
+        "max_steps": int(args.max_steps),
+        "scene_mode": args.scene_mode,
+        "execution_mode": args.execution_mode,
+        "planned_layout": args.planned_layout,
+        "curriculum": bool(args.curriculum),
+        "seed": int(args.seed),
+        "observation": "128x128 normalized depth + 7 joint positions + 7 joint velocities + gripper + previous action",
+        "action": ["dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper"],
+        "execution_note": "settle_then_kinematic uses dynamics only to settle reset scenes; PPO rollout uses IK and connector proxy",
+        "ground_truth_in_observation": False,
+        "target_id_in_observation": False,
+    }
+    (output_dir / "training_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    env.close()
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 

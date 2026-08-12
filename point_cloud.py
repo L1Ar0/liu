@@ -147,13 +147,15 @@ def get_kuka_joints_from_tip(
 def capture_rgbd(
     sim: Any,
     camera: int,
+    announce: bool = True,
 ):
     """
     主动处理 Vision Sensor，
     然后读取 RGB 和米制 Depth。
     """
 
-    print("\n正在处理 RGB-D Vision Sensor...")
+    if announce:
+        print("\n正在处理 RGB-D Vision Sensor...")
 
     # Explicit handling = ON 时需要这一句
     sim.handleVisionSensor(camera)

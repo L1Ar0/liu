@@ -1,8 +1,7 @@
-"""Optional depth-to-6D PPO components.
+"""Policy definitions shared by the end-to-end grasp environment and PPO.
 
-The policy is deliberately downstream of geometry recognition. It proposes a
-pixel, in-plane yaw and surface normal from depth only; PBVS, IK, collision
-checking and connector/lift verification remain authoritative.
+Actions are normalized Cartesian end-effector increments.  The policy never
+receives a target id, a fitted primitive, or a ground-truth object label.
 """
 
 from __future__ import annotations
@@ -24,6 +23,10 @@ except ImportError:  # pragma: no cover - optional dependency
 
 ACTION_DIM = 7
 STATE_SIZE = 128
+ACTION_NAMES = ("dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper")
+# Physical limits represented by a normalized action in [-1, 1].
+TRANSLATION_STEP_M = 0.005
+ROTATION_STEP_RAD = math.radians(5.0)
 
 
 def require_torch() -> Any:
@@ -39,6 +42,20 @@ def normalize_depth(depth: np.ndarray, near: float = 0.05, far: float = 1.5) -> 
     value = np.asarray(depth, dtype=np.float32)
     value = np.nan_to_num(value, nan=far, posinf=far, neginf=near)
     return np.clip((value - float(near)) / max(float(far - near), 1e-6), 0.0, 1.0)
+
+
+def decode_cartesian_action(action: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+    """Convert normalized policy output to ``(translation_m, rotvec_rad, gripper)``."""
+
+    value = np.asarray(action, dtype=np.float32).reshape(-1)
+    if value.size != ACTION_DIM:
+        raise ValueError(f"Expected {ACTION_DIM} action values, got {value.size}")
+    value = np.clip(value, -1.0, 1.0)
+    return (
+        value[:3].astype(np.float64) * TRANSLATION_STEP_M,
+        value[3:6].astype(np.float64) * ROTATION_STEP_RAD,
+        float(value[6]),
+    )
 
 
 def encode_action(
@@ -111,6 +128,9 @@ if torch is not None:
                 nn.AdaptiveAvgPool2d((1, 1)),
                 nn.Flatten(),
             )
+            # The standalone actor-critic remains useful for lightweight
+            # experiments.  End-to-end SB3 training uses the Dict extractor
+            # below, which also consumes robot state.
             self.actor = nn.Sequential(nn.Linear(128, 128), nn.Tanh(), nn.Linear(128, action_dim))
             self.critic = nn.Sequential(nn.Linear(128, 128), nn.Tanh(), nn.Linear(128, 1))
             self.log_std = nn.Parameter(torch.full((action_dim,), -1.0))
@@ -139,3 +159,52 @@ def make_state_tensor(states: np.ndarray, device: str = "cpu") -> Any:
     if value.ndim == 3:
         value = value[:, None, :, :]
     return backend.as_tensor(value, dtype=backend.float32, device=device)
+
+
+if torch is not None:
+    try:
+        from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+    except ImportError:  # pragma: no cover - optional dependency
+        BaseFeaturesExtractor = None  # type: ignore
+
+    if BaseFeaturesExtractor is not None:
+
+        class DepthProprioFeaturesExtractor(BaseFeaturesExtractor):
+            """CNN depth encoder fused with joint, velocity and gripper state."""
+
+            def __init__(self, observation_space: Any, features_dim: int = 256) -> None:
+                super().__init__(observation_space, features_dim)
+                depth_space = observation_space.spaces["depth"]
+                proprio_space = observation_space.spaces["proprio"]
+                channels, height, width = depth_space.shape
+                self.cnn = nn.Sequential(
+                    nn.Conv2d(channels, 32, 5, stride=2, padding=2),
+                    nn.ReLU(),
+                    nn.Conv2d(32, 64, 5, stride=2, padding=2),
+                    nn.ReLU(),
+                    nn.Conv2d(64, 128, 3, stride=2, padding=1),
+                    nn.ReLU(),
+                    nn.AdaptiveAvgPool2d((1, 1)),
+                    nn.Flatten(),
+                )
+                with torch.no_grad():
+                    sample = torch.zeros(1, channels, height, width)
+                    cnn_dim = int(self.cnn(sample).shape[1])
+                self.proprio = nn.Sequential(
+                    nn.Linear(int(np.prod(proprio_space.shape)), 64),
+                    nn.Tanh(),
+                )
+                self.fusion = nn.Sequential(
+                    nn.Linear(cnn_dim + 64, features_dim),
+                    nn.ReLU(),
+                )
+
+            def forward(self, observations: dict[str, Any]) -> Any:
+                depth = observations["depth"].float()
+                proprio = observations["proprio"].float().flatten(start_dim=1)
+                return self.fusion(torch.cat((self.cnn(depth), self.proprio(proprio)), dim=1))
+
+    else:
+        DepthProprioFeaturesExtractor = None  # type: ignore
+else:
+    DepthProprioFeaturesExtractor = None  # type: ignore

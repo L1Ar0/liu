@@ -13,8 +13,19 @@ from visual_servo_perception import (
     estimate_target_from_points,
     select_servo_target,
 )
-from ensure_simulation_stopped import is_grasp_connector_alias
-from visual_servo_runner import _attach_connector
+from ensure_simulation_stopped import (
+    is_grasp_connector_alias,
+    is_grasp_drop_box_alias,
+)
+from visual_servo_runner import (
+    SERVO_GRASP_PLANE_OFFSET_M,
+    SERVO_MIN_TCP_TABLE_CLEARANCE_M,
+    _approach_window_converged,
+    _cone_cross_section_center,
+    _grasp_section_half_width,
+    _attach_connector,
+    _target_grasp_pose,
+)
 
 
 def test_top_down_grasp_pose_has_expected_height_and_axis():
@@ -32,6 +43,43 @@ def test_top_down_grasp_pose_has_expected_height_and_axis():
     assert math.isclose(pose[2, 3], 0.12, abs_tol=1e-9)
 
 
+def test_final_grasp_pose_centers_tcp_on_rg2_jaw_plane():
+    center = np.asarray([0.5, 0.0, 0.0225])
+    state = TargetTrackState(
+        object_id=0,
+        class_name="sphere",
+        center_base_m=center,
+        rotation_base=np.eye(3),
+        dimensions_m=np.asarray([0.045, 0.045, 0.045]),
+        confidence=0.9,
+    )
+    pregrasp = _target_grasp_pose(
+        state,
+        0.09,
+        np.eye(3),
+        np.asarray([0.0, 0.0, 1.0]),
+        "top_down",
+    )
+    final = _target_grasp_pose(
+        state,
+        SERVO_GRASP_PLANE_OFFSET_M,
+        np.eye(3),
+        np.asarray([0.0, 0.0, 1.0]),
+        "top_down",
+        centered_grasp=True,
+    )
+    assert math.isclose(pregrasp[2, 3], 0.135, abs_tol=1e-9)
+    np.testing.assert_allclose(
+        final[:3, 3], center + [0.0, 0.0, SERVO_GRASP_PLANE_OFFSET_M]
+    )
+    assert math.isclose(
+        np.linalg.norm(final[:3, 3] - center),
+        SERVO_GRASP_PLANE_OFFSET_M,
+        abs_tol=1e-9,
+    )
+    assert final[2, 3] >= SERVO_MIN_TCP_TABLE_CLEARANCE_M
+
+
 def test_surface_aligned_pose_is_reachable_and_right_handed():
     pose = build_surface_aligned_grasp_pose(
         np.asarray([0.5, 0.0, 0.05]),
@@ -47,6 +95,62 @@ def test_surface_aligned_pose_is_reachable_and_right_handed():
     approach = -pose[:3, 2]
     tilt = math.degrees(math.acos(float(np.clip(np.dot(approach, [0, 0, 1]), -1.0, 1.0))))
     assert tilt <= 8.001
+
+
+def test_cone_grasp_uses_wider_lower_cross_section():
+    state = TargetTrackState(
+        object_id=1,
+        class_name="cone",
+        center_base_m=np.asarray([0.5, 0.0, 0.05]),
+        rotation_base=np.eye(3),
+        dimensions_m=np.asarray([0.045, 0.045, 0.060]),
+        confidence=0.8,
+    )
+    section_center = _cone_cross_section_center(
+        state, np.asarray([0.0, 0.0, 1.0])
+    )
+    assert math.isclose(section_center[2], 0.041, abs_tol=1e-9)
+    assert section_center[2] < state.center_base_m[2]
+
+
+def test_cylinder_jaw_width_ignores_noisy_pca_height_projection():
+    state = TargetTrackState(
+        object_id=2,
+        class_name="cylinder",
+        center_base_m=np.asarray([0.5, 0.0, 0.03]),
+        rotation_base=Rotation.from_euler("y", 25, degrees=True).as_matrix(),
+        dimensions_m=np.asarray([0.040, 0.040, 0.060]),
+        confidence=0.8,
+    )
+    assert math.isclose(
+        _grasp_section_half_width(state, np.asarray([1.0, 0.0, 0.0]), np.asarray([0.0, 0.0, 1.0])),
+        0.020,
+        abs_tol=1e-12,
+    )
+
+
+def test_cuboid_grasp_axis_uses_short_side_for_rg2():
+    pose = build_top_down_grasp_pose(
+        np.asarray([0.5, 0.0, 0.03]),
+        np.eye(3),
+        np.asarray([0.070, 0.035, 0.030]),
+        "cuboid",
+        0.01,
+        np.eye(3),
+        np.asarray([0.0, 0.0, 1.0]),
+    )
+    assert abs(float(np.dot(pose[:3, 0], [0.0, 1.0, 0.0]))) > 0.99
+
+
+def test_approach_window_rejects_noisy_or_drifting_target():
+    errors = [0.0030, 0.0032, 0.0031, 0.0033, 0.0032]
+    stable_centers = [np.asarray([0.5, 0.0, 0.04]) for _ in errors]
+    assert _approach_window_converged(errors, stable_centers)
+    drifting_centers = [
+        np.asarray([0.5 + index * 0.001, 0.0, 0.04])
+        for index in range(len(errors))
+    ]
+    assert not _approach_window_converged(errors, drifting_centers)
 
 
 def test_pbvs_increment_respects_translation_and_rotation_limits():
@@ -88,6 +192,57 @@ def test_servo_target_selection_prefers_unblocked_topmost_object():
         ]
     }
     assert select_servo_target(recognition)["id"] == 1
+
+
+def test_upper_random_target_excludes_blocked_base_and_sphere():
+    recognition = {
+        "objects": [
+            {
+                "id": 0,
+                "class": "cuboid",
+                "center_m": [0.5, 0.0, 0.015],
+                "confidence": 0.95,
+                "pose_valid": True,
+                "grasp_planning": {
+                    "topmost": False,
+                    "grasp_blocked": True,
+                },
+            },
+            {
+                "id": 1,
+                "class": "sphere",
+                "center_m": [0.5, 0.0, 0.062],
+                "confidence": 0.99,
+                "pose_valid": True,
+                "grasp_planning": {
+                    "topmost": True,
+                    "grasp_blocked": False,
+                },
+            },
+            {
+                "id": 2,
+                "class": "cylinder",
+                "center_m": [0.5, 0.0, 0.060],
+                "confidence": 0.40,
+                "pose_valid": True,
+                "grasp_planning": {
+                    "topmost": True,
+                    "grasp_blocked": False,
+                },
+            },
+        ]
+    }
+    selected = select_servo_target(
+        recognition,
+        policy="upper-random",
+        random_seed=20260811,
+    )
+    assert selected["id"] == 2
+
+
+def test_drop_box_alias_is_cleaned_separately_from_connector_alias():
+    assert is_grasp_drop_box_alias("grasp_drop_box_floor")
+    assert not is_grasp_drop_box_alias("rand_cube_01")
 
 
 def test_local_geometry_tracker_recovers_box_center_without_color():

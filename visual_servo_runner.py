@@ -23,6 +23,7 @@ from visual_servo_controller import (
     build_top_down_grasp_pose,
     matrix_from_pose,
     pose_from_matrix,
+    vertical_half_extent,
 )
 from visual_servo_perception import (
     TargetObservation,
@@ -37,6 +38,7 @@ from visual_servo_perception import (
 ROOT = Path(__file__).resolve().parent
 RECOGNITION_FILE = ROOT / "recognition_output" / "recognition_results.json"
 SEGMENTATION_FILE = ROOT / "segmentation_output" / "segmentation_metadata.json"
+GROUND_TRUTH_FILE = ROOT / "random_scene_ground_truth.json"
 OUTPUT_DIR = ROOT / "visual_servo_output"
 SUMMARY_FILE = OUTPUT_DIR / "visual_servo_summary.json"
 TRACE_FILE = OUTPUT_DIR / "visual_servo_trace.csv"
@@ -45,11 +47,14 @@ SERVO_RATE_HZ = float(os.environ.get("ROBOT_GRASP_SERVO_RATE_HZ", "15"))
 SERVO_PREGRASP_STANDOFF_M = float(
     os.environ.get("ROBOT_GRASP_SERVO_PREGRASP_STANDOFF_M", "0.090")
 )
-SERVO_FINAL_STANDOFF_M = float(
-    os.environ.get("ROBOT_GRASP_SERVO_FINAL_STANDOFF_M", "0.012")
+# The final TCP is placed at the RG2 jaw plane, rather than above the
+# object's visible top surface.  In the current scene the touch-pad plane is
+# about 2.1 mm in front of ``gripper_tip`` along the approach axis.
+SERVO_GRASP_PLANE_OFFSET_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_GRASP_PLANE_OFFSET_M", "0.00213")
 )
 SERVO_MAX_ITERATIONS = int(
-    os.environ.get("ROBOT_GRASP_SERVO_MAX_ITERATIONS", "90")
+    os.environ.get("ROBOT_GRASP_SERVO_MAX_ITERATIONS", "150")
 )
 SERVO_LOST_LIMIT = int(os.environ.get("ROBOT_GRASP_SERVO_LOST_LIMIT", "5"))
 SERVO_STABLE_FRAMES = int(os.environ.get("ROBOT_GRASP_SERVO_STABLE_FRAMES", "3"))
@@ -61,11 +66,47 @@ SERVO_LIFT_STEPS = int(os.environ.get("ROBOT_GRASP_SERVO_LIFT_STEPS", "60"))
 SERVO_LIFT_DURATION_S = float(
     os.environ.get("ROBOT_GRASP_SERVO_LIFT_DURATION_S", "2.0")
 )
+SERVO_PLACE_TRANSFER_STEPS = int(
+    os.environ.get("ROBOT_GRASP_SERVO_PLACE_TRANSFER_STEPS", "90")
+)
+SERVO_PLACE_TRANSFER_DURATION_S = float(
+    os.environ.get("ROBOT_GRASP_SERVO_PLACE_TRANSFER_DURATION_S", "3.0")
+)
+SERVO_PLACE_LOWER_STEPS = int(
+    os.environ.get("ROBOT_GRASP_SERVO_PLACE_LOWER_STEPS", "60")
+)
+SERVO_PLACE_LOWER_DURATION_S = float(
+    os.environ.get("ROBOT_GRASP_SERVO_PLACE_LOWER_DURATION_S", "2.0")
+)
+SERVO_PLACE_RETREAT_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_PLACE_RETREAT_M", "0.080")
+)
 SERVO_POSITION_TOLERANCE_M = float(
     os.environ.get("ROBOT_GRASP_SERVO_POSITION_TOLERANCE_M", "0.003")
 )
 SERVO_FINAL_POSITION_TOLERANCE_M = float(
     os.environ.get("ROBOT_GRASP_SERVO_FINAL_POSITION_TOLERANCE_M", "0.0045")
+)
+SERVO_FINAL_MEDIAN_POSITION_TOLERANCE_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_FINAL_MEDIAN_POSITION_TOLERANCE_M", "0.0035")
+)
+SERVO_FINAL_MAX_POSITION_TOLERANCE_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_FINAL_MAX_POSITION_TOLERANCE_M", "0.005")
+)
+SERVO_FINAL_CENTER_STD_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_FINAL_CENTER_STD_M", "0.0008")
+)
+SERVO_FINAL_WINDOW_SIZE = int(
+    os.environ.get("ROBOT_GRASP_SERVO_FINAL_WINDOW_SIZE", "5")
+)
+SERVO_FINAL_RELAXED_MEDIAN_TOLERANCE_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_FINAL_RELAXED_MEDIAN_TOLERANCE_M", "0.005")
+)
+SERVO_FINAL_RELAXED_MAX_TOLERANCE_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_FINAL_RELAXED_MAX_TOLERANCE_M", "0.006")
+)
+SERVO_FINAL_RELAXED_CENTER_STD_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_FINAL_RELAXED_CENTER_STD_M", "0.0012")
 )
 SERVO_ORIENTATION_TOLERANCE_RAD = math.radians(
     float(os.environ.get("ROBOT_GRASP_SERVO_ORIENTATION_TOLERANCE_DEG", "5"))
@@ -74,7 +115,7 @@ SERVO_FINAL_ORIENTATION_TOLERANCE_RAD = math.radians(
     float(os.environ.get("ROBOT_GRASP_SERVO_FINAL_ORIENTATION_TOLERANCE_DEG", "3"))
 )
 SERVO_MIN_TCP_TABLE_CLEARANCE_M = float(
-    os.environ.get("ROBOT_GRASP_SERVO_MIN_TCP_TABLE_CLEARANCE_M", "0.025")
+    os.environ.get("ROBOT_GRASP_SERVO_MIN_TCP_TABLE_CLEARANCE_M", "0.015")
 )
 SERVO_LIFT_M = float(os.environ.get("ROBOT_GRASP_SERVO_LIFT_M", "0.150"))
 SERVO_GRASP_MIN_CONFIDENCE = float(
@@ -85,6 +126,30 @@ SERVO_GRASP_MIN_POINTS = int(
 )
 SERVO_GRASP_MIN_IMAGE_MARGIN_PX = float(
     os.environ.get("ROBOT_GRASP_SERVO_GRASP_MIN_IMAGE_MARGIN_PX", "20")
+)
+SERVO_CONE_MIN_CONFIDENCE = float(
+    os.environ.get("ROBOT_GRASP_SERVO_CONE_MIN_CONFIDENCE", "0.40")
+)
+SERVO_CONE_MIN_POINTS = int(
+    os.environ.get("ROBOT_GRASP_SERVO_CONE_MIN_POINTS", "300")
+)
+SERVO_RG2_LEFT_PAD_HALF_SPAN_M = float(
+    os.environ.get("ROBOT_GRASP_RG2_LEFT_PAD_HALF_SPAN_M", "0.02586")
+)
+SERVO_RG2_RIGHT_PAD_HALF_SPAN_M = float(
+    os.environ.get("ROBOT_GRASP_RG2_RIGHT_PAD_HALF_SPAN_M", "0.02583")
+)
+SERVO_JAW_CENTERLINE_TOLERANCE_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_JAW_CENTERLINE_TOLERANCE_M", "0.0015")
+)
+SERVO_JAW_CLEARANCE_DIFFERENCE_TOLERANCE_M = float(
+    os.environ.get(
+        "ROBOT_GRASP_SERVO_JAW_CLEARANCE_DIFFERENCE_TOLERANCE_M",
+        "0.001",
+    )
+)
+SERVO_JAW_MAX_CENTERING_CORRECTION_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_JAW_MAX_CENTERING_CORRECTION_M", "0.008")
 )
 SERVO_TRACK_CENTER_ALPHA = float(
     os.environ.get("ROBOT_GRASP_SERVO_TRACK_CENTER_ALPHA", "0.20")
@@ -116,6 +181,24 @@ SERVO_APPROACH_MAX_TRANSLATION_STEP_M = float(
 SERVO_APPROACH_SLOW_TRANSLATION_STEP_M = float(
     os.environ.get("ROBOT_GRASP_SERVO_APPROACH_SLOW_TRANSLATION_STEP_M", "0.0007")
 )
+SERVO_APPROACH_FINAL_LINEAR_SPEED_M_S = float(
+    os.environ.get("ROBOT_GRASP_SERVO_APPROACH_FINAL_LINEAR_SPEED_M_S", "0.006")
+)
+SERVO_APPROACH_FINAL_TRANSLATION_STEP_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_APPROACH_FINAL_TRANSLATION_STEP_M", "0.0004")
+)
+SERVO_APPROACH_FILTER_ZONE_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_APPROACH_FILTER_ZONE_M", "0.020")
+)
+SERVO_APPROACH_FREEZE_ZONE_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_APPROACH_FREEZE_ZONE_M", "0.008")
+)
+SERVO_APPROACH_FILTER_ALPHA = float(
+    os.environ.get("ROBOT_GRASP_SERVO_APPROACH_FILTER_ALPHA", "0.08")
+)
+SERVO_APPROACH_MAX_UPDATE_M = float(
+    os.environ.get("ROBOT_GRASP_SERVO_APPROACH_MAX_UPDATE_M", "0.0005")
+)
 SERVO_MAX_ROTATION_STEP_DEG = float(
     os.environ.get("ROBOT_GRASP_SERVO_MAX_ROTATION_STEP_DEG", "1.2")
 )
@@ -144,6 +227,25 @@ USE_CONNECTOR = os.environ.get("ROBOT_GRASP_USE_CONNECTOR", "1").lower() not in 
 CONNECTOR_KINEMATIC_ONLY = os.environ.get(
     "ROBOT_GRASP_CONNECTOR_KINEMATIC_ONLY", "1"
 ).lower() not in {"0", "false", "no"}
+
+DROP_BOX_ALIAS_PREFIX = "grasp_drop_box_"
+DROP_BOX_INNER_X_M = float(os.environ.get("ROBOT_GRASP_DROP_BOX_INNER_X_M", "0.140"))
+DROP_BOX_INNER_Y_M = float(os.environ.get("ROBOT_GRASP_DROP_BOX_INNER_Y_M", "0.140"))
+DROP_BOX_WALL_HEIGHT_M = float(
+    os.environ.get("ROBOT_GRASP_DROP_BOX_WALL_HEIGHT_M", "0.080")
+)
+DROP_BOX_WALL_THICKNESS_M = float(
+    os.environ.get("ROBOT_GRASP_DROP_BOX_WALL_THICKNESS_M", "0.008")
+)
+DROP_BOX_FLOOR_THICKNESS_M = float(
+    os.environ.get("ROBOT_GRASP_DROP_BOX_FLOOR_THICKNESS_M", "0.008")
+)
+DROP_BOX_WORKSPACE_GAP_M = float(
+    os.environ.get("ROBOT_GRASP_DROP_BOX_WORKSPACE_GAP_M", "0.040")
+)
+DROP_BOX_OBJECT_CLEARANCE_M = float(
+    os.environ.get("ROBOT_GRASP_DROP_BOX_OBJECT_CLEARANCE_M", "0.003")
+)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -195,14 +297,165 @@ def _table_signed_height(position: np.ndarray, table_plane: np.ndarray) -> float
     return float((np.dot(position, plane[:3]) + plane[3]) / denominator)
 
 
+def _drop_box_geometry(table_plane: np.ndarray) -> dict[str, Any]:
+    """Compute an external, reachable drop-box layout in Robot Base coordinates."""
+
+    reference: dict[str, Any] = {}
+    if GROUND_TRUTH_FILE.exists():
+        try:
+            reference = _load_json(GROUND_TRUTH_FILE).get("reference", {})
+        except Exception:
+            reference = {}
+    center_x = float(
+        os.environ.get(
+            "ROBOT_GRASP_DROP_BOX_X_M",
+            reference.get("workspace_center_x", 0.525),
+        )
+    )
+    workspace_y = float(reference.get("workspace_center_y", -0.030))
+    workspace_half_y = float(reference.get("workspace_half_y", 0.090))
+    outer_y = DROP_BOX_INNER_Y_M + 2.0 * DROP_BOX_WALL_THICKNESS_M
+    center_y = float(
+        os.environ.get(
+            "ROBOT_GRASP_DROP_BOX_Y_M",
+            workspace_y
+            - workspace_half_y
+            - DROP_BOX_WORKSPACE_GAP_M
+            - 0.5 * outer_y,
+        )
+    )
+    plane = np.asarray(table_plane, dtype=np.float64).reshape(4)
+    normal = plane[:3] / max(float(np.linalg.norm(plane[:3])), 1e-12)
+    if abs(float(normal[2])) < 0.90:
+        raise RuntimeError("Drop box requires a table plane with a usable Z component")
+    table_z = float(
+        -(plane[0] * center_x + plane[1] * center_y + plane[3])
+        / max(abs(float(plane[2])), 1e-12)
+    )
+    return {
+        "center_xy_m": [center_x, center_y],
+        "table_z_m": table_z,
+        "floor_top_z_m": table_z + DROP_BOX_FLOOR_THICKNESS_M,
+        "inner_size_m": [DROP_BOX_INNER_X_M, DROP_BOX_INNER_Y_M],
+        "outer_size_m": [
+            DROP_BOX_INNER_X_M + 2.0 * DROP_BOX_WALL_THICKNESS_M,
+            outer_y,
+        ],
+        "wall_height_m": DROP_BOX_WALL_HEIGHT_M,
+    }
+
+
+def _remove_drop_box_shapes(sim: Any) -> int:
+    removed = 0
+    for handle in sim.getObjectsInTree(sim.handle_scene, sim.sceneobject_shape, 0):
+        try:
+            alias = str(sim.getObjectAlias(handle))
+        except Exception:
+            continue
+        if not alias.startswith(DROP_BOX_ALIAS_PREFIX):
+            continue
+        try:
+            sim.removeObject(handle)
+            removed += 1
+        except Exception:
+            pass
+    return removed
+
+
+def _create_drop_box(sim: Any, table_plane: np.ndarray) -> dict[str, Any]:
+    """Create a static five-piece box outside the recognition workspace."""
+
+    _remove_drop_box_shapes(sim)
+    geometry = _drop_box_geometry(table_plane)
+    center_x, center_y = geometry["center_xy_m"]
+    outer_x, outer_y = geometry["outer_size_m"]
+    thickness = DROP_BOX_WALL_THICKNESS_M
+    floor_thickness = DROP_BOX_FLOOR_THICKNESS_M
+    wall_height = DROP_BOX_WALL_HEIGHT_M
+    floor_top = geometry["floor_top_z_m"]
+    primitive_type = getattr(sim, "primitiveshape_cuboid")
+    created: list[int] = []
+
+    def add_piece(alias: str, size: list[float], center: list[float]) -> None:
+        handle = int(sim.createPrimitiveShape(primitive_type, size, 0))
+        created.append(handle)
+        sim.setObjectAlias(handle, alias)
+        sim.setObjectPose(handle, [*center, 0.0, 0.0, 0.0, 1.0], -1)
+        static_param = getattr(sim, "shapeintparam_static", None)
+        respondable_param = getattr(sim, "shapeintparam_respondable", None)
+        if static_param is not None:
+            try:
+                sim.setObjectInt32Param(handle, static_param, 1)
+            except Exception:
+                pass
+        if respondable_param is not None:
+            try:
+                sim.setObjectInt32Param(handle, respondable_param, 1)
+            except Exception:
+                pass
+        try:
+            sim.setShapeColor(
+                handle,
+                "",
+                sim.colorcomponent_ambient_diffuse,
+                [0.12, 0.35, 0.75],
+            )
+        except Exception:
+            pass
+
+    try:
+        add_piece(
+            f"{DROP_BOX_ALIAS_PREFIX}floor",
+            [outer_x, outer_y, floor_thickness],
+            [center_x, center_y, geometry["table_z_m"] + floor_thickness / 2.0],
+        )
+        add_piece(
+            f"{DROP_BOX_ALIAS_PREFIX}left",
+            [thickness, outer_y, wall_height],
+            [center_x - DROP_BOX_INNER_X_M / 2.0 - thickness / 2.0, center_y, floor_top + wall_height / 2.0],
+        )
+        add_piece(
+            f"{DROP_BOX_ALIAS_PREFIX}right",
+            [thickness, outer_y, wall_height],
+            [center_x + DROP_BOX_INNER_X_M / 2.0 + thickness / 2.0, center_y, floor_top + wall_height / 2.0],
+        )
+        add_piece(
+            f"{DROP_BOX_ALIAS_PREFIX}front",
+            [DROP_BOX_INNER_X_M, thickness, wall_height],
+            [center_x, center_y - DROP_BOX_INNER_Y_M / 2.0 - thickness / 2.0, floor_top + wall_height / 2.0],
+        )
+        add_piece(
+            f"{DROP_BOX_ALIAS_PREFIX}back",
+            [DROP_BOX_INNER_X_M, thickness, wall_height],
+            [center_x, center_y + DROP_BOX_INNER_Y_M / 2.0 + thickness / 2.0, floor_top + wall_height / 2.0],
+        )
+    except Exception:
+        for handle in created:
+            try:
+                sim.removeObject(handle)
+            except Exception:
+                pass
+        raise
+    geometry["handles"] = created
+    return geometry
+
+
 def _target_grasp_pose(
     state: TargetTrackState,
     standoff_m: float,
     current_tip_rotation: np.ndarray,
     table_normal: np.ndarray,
     orientation_mode: str,
+    centered_grasp: bool = False,
 ) -> np.ndarray:
-    """Select a geometry-only top-down or surface-aligned target pose."""
+    """Select a geometry-only target pose.
+
+    ``centered_grasp`` is used only for the final approach.  Pregrasp and
+    recovery poses must remain outside the object's bounding volume, while a
+    closing RG2 needs its touch-pad plane to pass through the selected grasp
+    section centre.  The returned TCP is therefore offset by a small,
+    calibrated jaw-plane distance instead of by the object's half extent.
+    """
 
     mode = str(orientation_mode).lower()
     use_surface = mode == "surface"
@@ -215,7 +468,7 @@ def _target_grasp_pose(
         )
         use_surface = tilt >= 8.0
     if use_surface:
-        return build_surface_aligned_grasp_pose(
+        pose = build_surface_aligned_grasp_pose(
             state.center_base_m,
             state.rotation_base,
             state.dimensions_m,
@@ -225,15 +478,27 @@ def _target_grasp_pose(
             table_normal,
             max_tilt_deg=GRASP_MAX_TILT_DEG,
         )
-    return build_top_down_grasp_pose(
-        state.center_base_m,
-        state.rotation_base,
-        state.dimensions_m,
-        state.class_name,
-        standoff_m,
-        current_tip_rotation,
-        table_normal,
-    )
+    else:
+        pose = build_top_down_grasp_pose(
+            state.center_base_m,
+            state.rotation_base,
+            state.dimensions_m,
+            state.class_name,
+            standoff_m,
+            current_tip_rotation,
+            table_normal,
+        )
+    if centered_grasp:
+        approach_axis = -np.asarray(pose[:3, 2], dtype=np.float64)
+        grasp_center = np.asarray(state.center_base_m, dtype=np.float64)
+        # Use a wider, lower cone section for the parallel jaws.  This is a
+        # catalogue-geometric correction, not a ground-truth pose lookup.
+        if state.class_name == "cone" and not use_surface:
+            grasp_center = _cone_cross_section_center(state, table_normal)
+        pose[:3, 3] = (
+            grasp_center + approach_axis * SERVO_GRASP_PLANE_OFFSET_M
+        )
+    return pose
 
 
 def _apply_initial_disturbance(
@@ -422,6 +687,206 @@ class IncrementalIK:
                 self.sim.setJointMode(joint, mode)
             except Exception:
                 pass
+
+
+def _cone_cross_section_center(
+    state: TargetTrackState,
+    table_normal: np.ndarray,
+    fraction_from_base: float = 0.35,
+) -> np.ndarray:
+    """Return a stable side-grasp point on the cone's useful cross-section.
+
+    A cone is not uniformly wide along its axis.  Grasping at the model centre
+    therefore places the RG2 pads on a smaller section than expected and makes
+    a one-sided contact likely.  The catalogue cone is parameterised with its
+    local Z axis from base to tip, so a point around 35% of the height gives a
+    repeatable, approximately 31 mm diameter section for the 45/5/60 mm CAD.
+    For a strongly leaning cone, the generic surface-aligned pose remains the
+    safer choice and this correction is intentionally skipped.
+    """
+
+    center = np.asarray(state.center_base_m, dtype=np.float64)
+    rotation = np.asarray(state.rotation_base, dtype=np.float64)
+    normal = np.asarray(table_normal, dtype=np.float64)
+    normal /= max(float(np.linalg.norm(normal)), 1e-12)
+    axis = rotation[:, 2]
+    if float(np.dot(axis, normal)) < 0.0:
+        axis = -axis
+    if abs(float(np.dot(axis, normal))) < math.cos(math.radians(25.0)):
+        return center
+    height = float(state.dimensions_m[2])
+    fraction = float(np.clip(fraction_from_base, 0.20, 0.50))
+    base_center = center - axis * (0.5 * height)
+    return base_center + axis * (fraction * height)
+
+
+def _approach_window_metrics(
+    position_errors_m: list[float],
+    center_history_m: list[np.ndarray],
+    window_size: int = SERVO_FINAL_WINDOW_SIZE,
+) -> tuple[float, float, float] | None:
+    """Compute robust final-approach error metrics from recent RGB-D frames."""
+
+    size = max(1, int(window_size))
+    if len(position_errors_m) < size or len(center_history_m) < size:
+        return None
+    errors = np.asarray(position_errors_m[-size:], dtype=np.float64)
+    centers = np.asarray(center_history_m[-size:], dtype=np.float64)
+    median_error = float(np.median(errors))
+    maximum_error = float(np.max(errors))
+    center_std = float(np.max(np.std(centers, axis=0)))
+    return median_error, maximum_error, center_std
+
+
+def _approach_window_converged(
+    position_errors_m: list[float],
+    center_history_m: list[np.ndarray],
+    relaxed: bool = False,
+) -> bool:
+    metrics = _approach_window_metrics(position_errors_m, center_history_m)
+    if metrics is None:
+        return False
+    median_error, maximum_error, center_std = metrics
+    if relaxed:
+        return (
+            median_error <= SERVO_FINAL_RELAXED_MEDIAN_TOLERANCE_M
+            and maximum_error <= SERVO_FINAL_RELAXED_MAX_TOLERANCE_M
+            and center_std <= SERVO_FINAL_RELAXED_CENTER_STD_M
+        )
+    return (
+        median_error <= SERVO_FINAL_MEDIAN_POSITION_TOLERANCE_M
+        and maximum_error <= SERVO_FINAL_MAX_POSITION_TOLERANCE_M
+        and center_std <= SERVO_FINAL_CENTER_STD_M
+    )
+
+
+def _grasp_section_half_width(
+    state: TargetTrackState,
+    jaw_axis: np.ndarray,
+    table_normal: np.ndarray,
+) -> float:
+    """Return the catalogue half-width seen by the two RG2 pads."""
+
+    axis = np.asarray(jaw_axis, dtype=np.float64)
+    axis /= max(float(np.linalg.norm(axis)), 1e-12)
+    if state.class_name == "cone":
+        base_diameter = float(state.dimensions_m[0])
+        top_diameter = float(
+            os.environ.get("ROBOT_GRASP_CONE_TOP_DIAMETER_M", "0.005")
+        )
+        fraction = 0.35
+        return 0.5 * (
+            base_diameter + fraction * (top_diameter - base_diameter)
+        )
+    if state.class_name == "sphere":
+        return 0.5 * float(state.dimensions_m[0])
+    if state.class_name == "cylinder":
+        # The cylinder is rotationally symmetric around its fitted axis.  A
+        # noisy PCA frame must not project the 60 mm height into the jaw
+        # direction and falsely report an over-wide 52 mm section.
+        return 0.5 * float(state.dimensions_m[0])
+    rotation = np.asarray(state.rotation_base, dtype=np.float64)
+    return 0.5 * float(
+        np.sum(np.abs(rotation.T @ axis) * state.dimensions_m)
+    )
+
+
+def _jaw_centering_metrics(
+    current_tip_pose: np.ndarray,
+    desired_tip_pose: np.ndarray,
+    state: TargetTrackState,
+    table_normal: np.ndarray,
+) -> dict[str, float]:
+    """Estimate bilateral pad clearances without reading object ground truth."""
+
+    current = np.asarray(current_tip_pose, dtype=np.float64)
+    desired = np.asarray(desired_tip_pose, dtype=np.float64)
+    approach_axis = -desired[:3, 2]
+    approach_axis /= max(float(np.linalg.norm(approach_axis)), 1e-12)
+    jaw_axis = desired[:3, 0]
+    jaw_axis /= max(float(np.linalg.norm(jaw_axis)), 1e-12)
+    grasp_center = desired[:3, 3] - approach_axis * SERVO_GRASP_PLANE_OFFSET_M
+    jaw_midpoint = current[:3, 3] - approach_axis * SERVO_GRASP_PLANE_OFFSET_M
+    center_delta = grasp_center - jaw_midpoint
+    center_offset = float(np.dot(center_delta, jaw_axis))
+    lateral_delta = center_delta - float(np.dot(center_delta, approach_axis)) * approach_axis
+    half_width = _grasp_section_half_width(state, jaw_axis, table_normal)
+    left_clearance = SERVO_RG2_LEFT_PAD_HALF_SPAN_M - (half_width + center_offset)
+    right_clearance = SERVO_RG2_RIGHT_PAD_HALF_SPAN_M - (half_width - center_offset)
+    return {
+        "centerline_error_m": float(np.linalg.norm(lateral_delta)),
+        "position_error_m": float(np.linalg.norm(desired[:3, 3] - current[:3, 3])),
+        "left_clearance_m": float(left_clearance),
+        "right_clearance_m": float(right_clearance),
+        "clearance_difference_m": float(abs(left_clearance - right_clearance)),
+        "section_width_m": float(2.0 * half_width),
+    }
+
+
+def _center_gripper_before_close(
+    ik: IncrementalIK,
+    state: TargetTrackState,
+    table_plane: np.ndarray,
+    grasp_orientation: str,
+) -> dict[str, float]:
+    """Place the fitted target section on the calibrated RG2 jaw midpoint."""
+
+    current = ik.current_pose()
+    desired = _target_grasp_pose(
+        state,
+        SERVO_GRASP_PLANE_OFFSET_M,
+        current[:3, :3],
+        table_plane[:3],
+        grasp_orientation,
+        centered_grasp=True,
+    )
+    before = _jaw_centering_metrics(current, desired, state, table_plane[:3])
+    correction = float(before["position_error_m"])
+    if correction > SERVO_JAW_MAX_CENTERING_CORRECTION_M:
+        raise RuntimeError(
+            "Refusing grasp: final jaw-centering correction is too large "
+            f"({correction * 1000.0:.2f} mm)"
+        )
+    if correction > 0.0002:
+        steps = max(8, int(math.ceil(correction / 0.0004)))
+        duration = max(0.6, correction / max(SERVO_APPROACH_FINAL_LINEAR_SPEED_M_S, 1e-6))
+        ik.move_linear(
+            desired,
+            steps,
+            table_plane,
+            duration_s=duration,
+        )
+    after = _jaw_centering_metrics(
+        ik.current_pose(),
+        desired,
+        state,
+        table_plane[:3],
+    )
+    if after["centerline_error_m"] > SERVO_JAW_CENTERLINE_TOLERANCE_M:
+        raise RuntimeError(
+            "Refusing grasp: object section is not centered between RG2 pads "
+            f"({after['centerline_error_m'] * 1000.0:.2f} mm)"
+        )
+    if (
+        after["clearance_difference_m"]
+        > SERVO_JAW_CLEARANCE_DIFFERENCE_TOLERANCE_M
+    ):
+        raise RuntimeError(
+            "Refusing grasp: predicted left/right jaw clearances differ by "
+            f"{after['clearance_difference_m'] * 1000.0:.2f} mm"
+        )
+    if after["left_clearance_m"] < -0.001 or after["right_clearance_m"] < -0.001:
+        raise RuntimeError(
+            "Refusing grasp: target cross-section exceeds the calibrated RG2 opening"
+        )
+    return {
+        "correction_mm": correction * 1000.0,
+        "centerline_error_mm": after["centerline_error_m"] * 1000.0,
+        "left_clearance_mm": after["left_clearance_m"] * 1000.0,
+        "right_clearance_mm": after["right_clearance_m"] * 1000.0,
+        "clearance_difference_mm": after["clearance_difference_m"] * 1000.0,
+        "section_width_mm": after["section_width_m"] * 1000.0,
+    }
 
 
 def _set_gripper_signal(sim: Any, value: int) -> None:
@@ -692,17 +1157,27 @@ def _validate_grasp_observation(
 ) -> None:
     """Reject an obviously weak target before closing the physical gripper."""
 
-    if state.confidence < SERVO_GRASP_MIN_CONFIDENCE:
+    required_confidence = (
+        SERVO_CONE_MIN_CONFIDENCE
+        if state.class_name == "cone"
+        else SERVO_GRASP_MIN_CONFIDENCE
+    )
+    if state.confidence < required_confidence:
         raise RuntimeError(
             "Refusing physical grasp: target confidence is "
-            f"{state.confidence:.2f} < {SERVO_GRASP_MIN_CONFIDENCE:.2f}"
+            f"{state.confidence:.2f} < {required_confidence:.2f}"
         )
     if observation is None:
         raise RuntimeError("Refusing physical grasp: no final RGB-D target observation")
-    if observation.point_count < SERVO_GRASP_MIN_POINTS:
+    minimum_points = (
+        SERVO_CONE_MIN_POINTS
+        if state.class_name == "cone"
+        else SERVO_GRASP_MIN_POINTS
+    )
+    if observation.point_count < minimum_points:
         raise RuntimeError(
             "Refusing physical grasp: final target point count is "
-            f"{observation.point_count} < {SERVO_GRASP_MIN_POINTS}"
+            f"{observation.point_count} < {minimum_points}"
         )
     if observation.image_margin_px < SERVO_GRASP_MIN_IMAGE_MARGIN_PX:
         raise RuntimeError(
@@ -784,19 +1259,150 @@ def _lift_and_verify(
     )
 
 
+def _place_attached_target_in_box(
+    sim: Any,
+    ik: IncrementalIK,
+    target_state: TargetTrackState,
+    table_plane: np.ndarray,
+    connector_attachment: dict[str, Any],
+) -> dict[str, Any]:
+    """Transfer an attached workpiece to the external box and release it."""
+
+    target_handle = int(connector_attachment["target_handle"])
+    connector_handle = connector_attachment.get("connector_handle")
+    box = _create_drop_box(sim, table_plane)
+    normal = np.asarray(table_plane[:3], dtype=np.float64)
+    normal /= max(float(np.linalg.norm(normal)), 1e-12)
+
+    target_pose = matrix_from_pose(sim.getObjectPose(target_handle, ik.robot_base))
+    target_center = target_pose[:3, 3].copy()
+    box_x, box_y = box["center_xy_m"]
+
+    transfer_pose = ik.current_pose()
+    transfer_pose[:3, 3] += np.asarray(
+        [box_x - target_center[0], box_y - target_center[1], 0.0],
+        dtype=np.float64,
+    )
+    print(
+        "Transferring grasped object to external drop box at "
+        f"({box_x:.3f}, {box_y:.3f}) m..."
+    )
+    ik.move_linear(
+        transfer_pose,
+        SERVO_PLACE_TRANSFER_STEPS,
+        table_plane,
+        duration_s=SERVO_PLACE_TRANSFER_DURATION_S,
+    )
+
+    target_pose = matrix_from_pose(sim.getObjectPose(target_handle, ik.robot_base))
+    half_extent = vertical_half_extent(
+        target_pose[:3, :3],
+        target_state.dimensions_m,
+        normal,
+    )
+    desired_center = np.asarray(
+        [
+            box_x,
+            box_y,
+            float(box["floor_top_z_m"])
+            + half_extent
+            + DROP_BOX_OBJECT_CLEARANCE_M,
+        ],
+        dtype=np.float64,
+    )
+    lower_pose = ik.current_pose()
+    lower_pose[:3, 3] += desired_center - target_pose[:3, 3]
+    ik.move_linear(
+        lower_pose,
+        SERVO_PLACE_LOWER_STEPS,
+        table_plane,
+        duration_s=SERVO_PLACE_LOWER_DURATION_S,
+    )
+
+    sim.setObjectParent(target_handle, -1, True)
+    static_param = getattr(sim, "shapeintparam_static", None)
+    respondable_param = getattr(sim, "shapeintparam_respondable", None)
+    if static_param is not None:
+        try:
+            sim.setObjectInt32Param(target_handle, static_param, 1)
+        except Exception:
+            pass
+    if respondable_param is not None:
+        try:
+            sim.setObjectInt32Param(target_handle, respondable_param, 1)
+        except Exception:
+            pass
+    if connector_handle is not None:
+        try:
+            sim.removeObject(int(connector_handle))
+        except Exception:
+            pass
+    _set_gripper_signal(sim, GRIPPER_OPEN_VALUE)
+
+    placed_center = np.asarray(
+        sim.getObjectPosition(target_handle, ik.robot_base), dtype=np.float64
+    )
+    placement_error = float(np.linalg.norm(placed_center - desired_center))
+    if placement_error > 0.010:
+        raise RuntimeError(
+            "Drop-box placement error exceeded 10 mm: "
+            f"{placement_error * 1000.0:.2f} mm"
+        )
+
+    retreat_pose = ik.current_pose()
+    retreat_pose[:3, 3] += normal * SERVO_PLACE_RETREAT_M
+    ik.move_linear(
+        retreat_pose,
+        max(1, SERVO_PLACE_LOWER_STEPS // 2),
+        table_plane,
+        duration_s=max(0.5, SERVO_PLACE_LOWER_DURATION_S / 2.0),
+    )
+    connector_attachment["attached"] = False
+    connector_attachment["released_to_box"] = True
+    connector_attachment["connector_handle"] = None
+    print(
+        "Drop-box placement: PASS "
+        f"(error={placement_error * 1000.0:.2f} mm)"
+    )
+    return {
+        "completed": True,
+        "target_handle": target_handle,
+        "target_alias": connector_attachment.get("target_alias"),
+        "box_center_m": [box_x, box_y, float(box["floor_top_z_m"])],
+        "box_handles": [int(value) for value in box["handles"]],
+        "desired_object_center_m": desired_center.tolist(),
+        "placed_object_center_m": placed_center.tolist(),
+        "placement_error_mm": placement_error * 1000.0,
+        "released": True,
+        "retreated": True,
+    }
+
+
 def run_visual_servo(
     target_id: int | None = None,
     execute_grasp: bool = False,
     max_iterations: int = SERVO_MAX_ITERATIONS,
     grasp_orientation: str = GRASP_ORIENTATION_MODE,
+    target_policy: str = "upper-random",
+    selection_seed: int | None = None,
+    place_in_box: bool = False,
     initial_translation_m: np.ndarray | None = None,
     initial_euler_deg: np.ndarray | None = None,
     open_loop_only: bool = False,
     align_only: bool = False,
 ) -> dict[str, Any]:
+    if place_in_box and not execute_grasp:
+        raise RuntimeError("Drop-box placement requires grasp execution")
+    if place_in_box and not USE_CONNECTOR:
+        raise RuntimeError("Drop-box placement requires the deterministic connector")
     recognition = _load_json(RECOGNITION_FILE)
     segmentation = _load_json(SEGMENTATION_FILE)
-    target_prediction = select_servo_target(recognition, target_id)
+    target_prediction = select_servo_target(
+        recognition,
+        target_id,
+        policy=target_policy,
+        random_seed=selection_seed,
+    )
     state = track_state_from_prediction(target_prediction)
     table_plane = np.asarray(
         segmentation.get("table_plane", [0.0, 0.0, 1.0, 0.0]),
@@ -833,7 +1439,9 @@ def run_visual_servo(
     pregrasp_pose = None
     last_observation: TargetObservation | None = None
     gripper_close_motion = None
+    jaw_centering: dict[str, float] | None = None
     connector_attachment: dict[str, Any] | None = None
+    placement_result: dict[str, Any] | None = None
     try:
         current = ik.current_pose()
         pregrasp_pose = _target_grasp_pose(
@@ -946,17 +1554,19 @@ def run_visual_servo(
                 SERVO_PREGRASP_STANDOFF_M,
                 SERVO_POSITION_TOLERANCE_M,
                 SERVO_ORIENTATION_TOLERANCE_RAD,
+                False,
             ),
             (
                 "approach",
-                SERVO_FINAL_STANDOFF_M,
+                SERVO_GRASP_PLANE_OFFSET_M,
                 SERVO_FINAL_POSITION_TOLERANCE_M,
                 SERVO_FINAL_ORIENTATION_TOLERANCE_RAD,
+                True,
             ),
         ]
         if align_only:
             phases = phases[:1]
-        for phase_name, standoff, position_tol, orientation_tol in phases:
+        for phase_name, standoff, position_tol, orientation_tol, centered_grasp in phases:
             print(f"\n--- Visual servo phase: {phase_name} ---")
             phase_controller = PBVSController(
                 position_gain=1.2 if phase_name == "approach" else 1.4,
@@ -977,6 +1587,10 @@ def run_visual_servo(
                 max_rotation_step_rad=math.radians(SERVO_MAX_ROTATION_STEP_DEG),
             )
             stable_count = 0
+            approach_error_history: list[float] = []
+            approach_observation_history: list[np.ndarray] = []
+            approach_center_history: list[np.ndarray] = []
+            approach_center_anchor: np.ndarray | None = None
             for phase_iteration in range(max(1, int(max_iterations))):
                 total_iterations += 1
                 observation = capture_target_observation(
@@ -1020,19 +1634,97 @@ def run_visual_servo(
 
                 lost_count = 0
                 last_observation = observation
-                state = update_track_state(
-                    state,
-                    observation,
-                    center_alpha=SERVO_TRACK_CENTER_ALPHA,
-                    max_center_update_m=SERVO_TRACK_MAX_UPDATE_M,
-                )
                 current = ik.current_pose()
+                if phase_name == "approach":
+                    # The last few RGB-D frames are affected by depth
+                    # quantisation and by the approaching jaws.  Track their
+                    # median, then freeze the centre in the final 8 mm so PBVS
+                    # does not oscillate around a moving measurement.
+                    approach_observation_history.append(
+                        np.asarray(observation.center_base_m, dtype=np.float64).copy()
+                    )
+                    history_limit = max(10, 2 * SERVO_FINAL_WINDOW_SIZE)
+                    if len(approach_observation_history) > history_limit:
+                        del approach_observation_history[:-history_limit]
+                    median_center = np.median(
+                        np.asarray(approach_observation_history, dtype=np.float64)[-SERVO_FINAL_WINDOW_SIZE:],
+                        axis=0,
+                    )
+                    filtered_observation = TargetObservation(
+                        center_base_m=median_center,
+                        rotation_base=observation.rotation_base,
+                        point_count=observation.point_count,
+                        confidence=observation.confidence,
+                        image_pixel=observation.image_pixel,
+                        image_margin_px=observation.image_margin_px,
+                        extent_m=observation.extent_m,
+                    )
+                    probe_desired = _target_grasp_pose(
+                        state,
+                        standoff,
+                        current[:3, :3],
+                        table_plane[:3],
+                        grasp_orientation,
+                        centered_grasp=True,
+                    )
+                    probe_error = phase_controller.pose_error(current, probe_desired)
+                    if approach_center_anchor is None:
+                        if probe_error.position_norm_m <= SERVO_APPROACH_FREEZE_ZONE_M:
+                            state = update_track_state(
+                                state,
+                                filtered_observation,
+                                center_alpha=1.0,
+                                max_center_update_m=SERVO_APPROACH_MAX_UPDATE_M,
+                            )
+                            approach_center_anchor = state.center_base_m.copy()
+                        else:
+                            state = update_track_state(
+                                state,
+                                filtered_observation,
+                                center_alpha=(
+                                    SERVO_APPROACH_FILTER_ALPHA
+                                    if probe_error.position_norm_m <= SERVO_APPROACH_FILTER_ZONE_M
+                                    else SERVO_TRACK_CENTER_ALPHA
+                                ),
+                                max_center_update_m=(
+                                    SERVO_APPROACH_MAX_UPDATE_M
+                                    if probe_error.position_norm_m <= SERVO_APPROACH_FILTER_ZONE_M
+                                    else SERVO_TRACK_MAX_UPDATE_M
+                                ),
+                            )
+                    else:
+                        state = TargetTrackState(
+                            object_id=state.object_id,
+                            class_name=state.class_name,
+                            center_base_m=approach_center_anchor.copy(),
+                            rotation_base=observation.rotation_base,
+                            dimensions_m=state.dimensions_m.copy(),
+                            confidence=float(observation.confidence),
+                            anchor_center_base_m=(
+                                None
+                                if state.anchor_center_base_m is None
+                                else state.anchor_center_base_m.copy()
+                            ),
+                            anchor_rotation_base=(
+                                None
+                                if state.anchor_rotation_base is None
+                                else state.anchor_rotation_base.copy()
+                            ),
+                        )
+                else:
+                    state = update_track_state(
+                        state,
+                        observation,
+                        center_alpha=SERVO_TRACK_CENTER_ALPHA,
+                        max_center_update_m=SERVO_TRACK_MAX_UPDATE_M,
+                    )
                 desired = _target_grasp_pose(
                     state,
                     standoff,
                     current[:3, :3],
                     table_plane[:3],
                     grasp_orientation,
+                    centered_grasp=centered_grasp,
                 )
                 if phase_name == "approach":
                     approach_error = phase_controller.pose_error(current, desired)
@@ -1045,13 +1737,24 @@ def run_visual_servo(
                         else SERVO_APPROACH_MAX_LINEAR_SPEED_M_S
                     )
                     phase_controller.max_translation_step_m = (
-                        SERVO_APPROACH_SLOW_TRANSLATION_STEP_M
-                        if slow_approach
-                        else SERVO_APPROACH_MAX_TRANSLATION_STEP_M
+                        SERVO_APPROACH_FINAL_TRANSLATION_STEP_M
+                        if approach_error.position_norm_m <= SERVO_APPROACH_FREEZE_ZONE_M
+                        else (
+                            SERVO_APPROACH_SLOW_TRANSLATION_STEP_M
+                            if slow_approach
+                            else SERVO_APPROACH_MAX_TRANSLATION_STEP_M
+                        )
                     )
+                    if approach_error.position_norm_m <= SERVO_APPROACH_FREEZE_ZONE_M:
+                        phase_controller.max_linear_speed_m_s = SERVO_APPROACH_FINAL_LINEAR_SPEED_M_S
                 command = phase_controller.command(current, desired)
                 error = command.error
                 final_error = error
+                if phase_name == "approach":
+                    approach_error_history.append(float(error.position_norm_m))
+                    approach_center_history.append(state.center_base_m.copy())
+                    if len(approach_error_history) > max(10, 2 * SERVO_FINAL_WINDOW_SIZE):
+                        del approach_error_history[:-max(10, 2 * SERVO_FINAL_WINDOW_SIZE)]
                 trace.append(
                     {
                         "iteration": total_iterations,
@@ -1071,7 +1774,20 @@ def run_visual_servo(
                     f"points={observation.point_count}"
                 )
 
-                if phase_controller.converged(error, position_tol, orientation_tol):
+                if phase_name == "approach":
+                    window_converged = _approach_window_converged(
+                        approach_error_history,
+                        approach_center_history,
+                    )
+                    converged_now = (
+                        window_converged
+                        and error.rotation_norm_rad <= orientation_tol
+                    )
+                else:
+                    converged_now = phase_controller.converged(
+                        error, position_tol, orientation_tol
+                    )
+                if converged_now:
                     stable_count += 1
                     if stable_count >= SERVO_STABLE_FRAMES:
                         break
@@ -1087,16 +1803,45 @@ def run_visual_servo(
                 current = ik.apply(next_pose)
                 time.sleep(dt)
             else:
-                raise RuntimeError(
-                    f"Visual servo phase {phase_name} did not converge in "
-                    f"{max_iterations} iterations"
-                )
+                if phase_name == "approach" and _approach_window_converged(
+                    approach_error_history,
+                    approach_center_history,
+                    relaxed=True,
+                ):
+                    metrics = _approach_window_metrics(
+                        approach_error_history,
+                        approach_center_history,
+                    )
+                    print(
+                        "Visual servo approach accepted with depth-noise tolerance: "
+                        f"median={metrics[0] * 1000.0:.2f} mm, "
+                        f"max={metrics[1] * 1000.0:.2f} mm, "
+                        f"center_std={metrics[2] * 1000.0:.2f} mm"
+                    )
+                    stable_count = SERVO_STABLE_FRAMES
+                else:
+                    raise RuntimeError(
+                        f"Visual servo phase {phase_name} did not converge in "
+                        f"{max_iterations} iterations"
+                    )
             if stable_count < SERVO_STABLE_FRAMES:
                 raise RuntimeError(f"Visual servo phase {phase_name} ended without stable convergence")
             print(f"Visual servo phase {phase_name} converged")
 
         grasp_verified = None
         if execute_grasp:
+            jaw_centering = _center_gripper_before_close(
+                ik,
+                state,
+                table_plane,
+                grasp_orientation,
+            )
+            print(
+                "RG2 bilateral centering: "
+                f"section={jaw_centering['section_width_mm']:.1f} mm, "
+                f"left_gap={jaw_centering['left_clearance_mm']:.1f} mm, "
+                f"right_gap={jaw_centering['right_clearance_mm']:.1f} mm"
+            )
             _validate_grasp_observation(state, last_observation)
             restored = _prepare_physics_grasp(sim, robot_base)
             if restored:
@@ -1152,6 +1897,16 @@ def run_visual_servo(
                 raise RuntimeError(
                     "Grasp execution completed, but RGB-D lift verification failed"
                 )
+            if place_in_box:
+                if connector_attachment is None:
+                    raise RuntimeError("Cannot place object without a connector attachment")
+                placement_result = _place_attached_target_in_box(
+                    sim,
+                    ik,
+                    state,
+                    table_plane,
+                    connector_attachment,
+                )
         else:
             print("Final visual-servo alignment reached; gripper execution was skipped")
 
@@ -1166,12 +1921,16 @@ def run_visual_servo(
             "execute_grasp": bool(execute_grasp),
             "grasp_verified": grasp_verified,
             "connector_attachment": connector_attachment,
+            "placement": placement_result,
             "gripper_close_joint_motion": gripper_close_motion,
+            "jaw_centering": jaw_centering,
             "final_position_error_mm": None if final_error is None else final_error.position_norm_m * 1000.0,
             "final_rotation_error_deg": None if final_error is None else math.degrees(final_error.rotation_norm_rad),
             "uses_color_features": False,
             "controller": "rgbd_pbvs_incremental_ik",
             "grasp_orientation": str(grasp_orientation),
+            "target_policy": str(target_policy),
+            "selection_seed": selection_seed,
             "max_commanded_tilt_deg": GRASP_MAX_TILT_DEG,
             "control_mode": "closed_loop",
             "initial_translation_mm": None
@@ -1190,9 +1949,13 @@ def run_visual_servo(
             "converged": False,
             "execute_grasp": bool(execute_grasp),
             "connector_attachment": connector_attachment,
+            "placement": placement_result,
+            "jaw_centering": jaw_centering,
             "uses_color_features": False,
             "controller": "rgbd_pbvs_incremental_ik",
             "grasp_orientation": str(grasp_orientation),
+            "target_policy": str(target_policy),
+            "selection_seed": selection_seed,
             "control_mode": "closed_loop",
             "error": str(exc),
         }
@@ -1212,6 +1975,18 @@ def main() -> None:
     parser.add_argument("--target-id", type=int)
     parser.add_argument("--execute-grasp", action="store_true")
     parser.add_argument("--max-iterations", type=int, default=SERVO_MAX_ITERATIONS)
+    parser.add_argument(
+        "--target-policy",
+        choices=("auto", "upper-random"),
+        default=os.environ.get("ROBOT_GRASP_SERVO_TARGET_POLICY", "upper-random"),
+        help="automatic target selection policy when --target-id is omitted",
+    )
+    parser.add_argument("--selection-seed", type=int)
+    parser.add_argument(
+        "--place-in-box",
+        action="store_true",
+        help="after lift verification, transfer and release the object into an external box",
+    )
     parser.add_argument(
         "--grasp-orientation",
         choices=("auto", "top_down", "surface"),
@@ -1244,6 +2019,9 @@ def main() -> None:
         execute_grasp=args.execute_grasp,
         max_iterations=max(1, int(args.max_iterations)),
         grasp_orientation=args.grasp_orientation,
+        target_policy=args.target_policy,
+        selection_seed=args.selection_seed,
+        place_in_box=bool(args.place_in_box),
         initial_translation_m=None
         if args.initial_offset_mm is None
         else np.asarray(args.initial_offset_mm, dtype=np.float64) / 1000.0,

@@ -129,7 +129,32 @@ def _visibility(
         ]
     )
     bounds = camera_model["safe_bounds"]
-    if (
+    policy = str(camera_model.get("visibility_policy", "full")).lower()
+    if policy == "center":
+        centre = np.asarray([float(center[0]), float(center[1]), float(center[2])], dtype=np.float64)
+        centre_camera = (centre - camera_translation) @ camera_rotation
+        centre_z = float(centre_camera[2])
+        if centre_z <= float(camera_model["near"]) or centre_z >= float(camera_model["far"]):
+            return None
+        centre_pixel = np.asarray(
+            [
+                (1.0 - centre_camera[0] / (centre_z * tan_x)) * 0.5 * (camera_model["width"] - 1),
+                (1.0 - centre_camera[1] / (centre_z * tan_y)) * 0.5 * (camera_model["height"] - 1),
+            ],
+            dtype=np.float64,
+        )
+        if (
+            float(centre_pixel[0]) < bounds["u_min"]
+            or float(centre_pixel[0]) > bounds["u_max"]
+            or float(centre_pixel[1]) < bounds["v_min"]
+            or float(centre_pixel[1]) > bounds["v_max"]
+            or float(pixels[:, 0].max()) < 0.0
+            or float(pixels[:, 0].min()) > camera_model["width"] - 1
+            or float(pixels[:, 1].max()) < 0.0
+            or float(pixels[:, 1].min()) > camera_model["height"] - 1
+        ):
+            return None
+    elif (
         float(pixels[:, 0].min()) < bounds["u_min"]
         or float(pixels[:, 0].max()) > bounds["u_max"]
         or float(pixels[:, 1].min()) < bounds["v_min"]
@@ -564,7 +589,7 @@ def build_planned_layout(
     selected = _select_layout(rng, layout or os.environ.get("ROBOT_GRASP_PLANNED_LAYOUT", "auto"))
     round_class = _round_class()
     classes, _ = _recipe(selected, round_class)
-    target_count = max(5, PLANNED_OBJECT_COUNT)
+    target_count = max(1, PLANNED_OBJECT_COUNT)
     classes = classes[:target_count]
     while len(classes) < target_count:
         classes.append(str(rng.choice(["cube", "cuboid", "cylinder", round_class, "cone"])))

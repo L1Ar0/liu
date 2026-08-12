@@ -68,6 +68,15 @@ def parse_args() -> argparse.Namespace:
         help="prediction id to servo; otherwise the safest topmost object is selected",
     )
     parser.add_argument(
+        "--servo-target-policy",
+        choices=("auto", "upper-random"),
+        default=os.environ.get("ROBOT_GRASP_SERVO_TARGET_POLICY", "upper-random"),
+        help=(
+            "automatic target policy; upper-random excludes blocked stack bases "
+            "and avoids sphere when another safe candidate exists"
+        ),
+    )
+    parser.add_argument(
         "--servo-grasp-orientation",
         choices=("auto", "top_down", "surface"),
         default=os.environ.get("ROBOT_GRASP_SERVO_GRASP_ORIENTATION", "auto"),
@@ -84,6 +93,11 @@ def parse_args() -> argparse.Namespace:
         default=1000.0
         * float(os.environ.get("ROBOT_GRASP_SERVO_LIFT_M", "0.150")),
         help="vertical lift distance after attachment; default 150 mm",
+    )
+    parser.add_argument(
+        "--servo-place-in-box",
+        action="store_true",
+        help="after a verified lift, move the object into an external drop box and release it",
     )
     parser.add_argument(
         "--depth-grasp-checkpoint",
@@ -115,6 +129,10 @@ def main() -> None:
     args = parse_args()
     if args.servo_execute_grasp and not args.visual_servo:
         raise SystemExit("--servo-execute-grasp requires --visual-servo")
+    if args.servo_place_in_box and not args.servo_execute_grasp:
+        raise SystemExit("--servo-place-in-box requires --servo-execute-grasp")
+    if args.servo_place_in_box and args.no_connector:
+        raise SystemExit("--servo-place-in-box requires connector mode")
     if args.servo_lift_height_mm <= 0.0:
         raise SystemExit("--servo-lift-height-mm must be positive")
     environment = os.environ.copy()
@@ -139,6 +157,7 @@ def main() -> None:
     environment.pop("ROBOT_GRASP_ALLOW_GT_COUNT", None)
     environment["ROBOT_GRASP_USE_CONNECTOR"] = "0" if args.no_connector else "1"
     environment["ROBOT_GRASP_SERVO_GRASP_ORIENTATION"] = args.servo_grasp_orientation
+    environment["ROBOT_GRASP_SERVO_TARGET_POLICY"] = args.servo_target_policy
     environment["ROBOT_GRASP_SERVO_LIFT_M"] = str(
         float(args.servo_lift_height_mm) / 1000.0
     )
@@ -185,9 +204,18 @@ def main() -> None:
             servo_arguments.extend(["--target-id", str(args.servo_target_id)])
         if args.servo_execute_grasp:
             servo_arguments.append("--execute-grasp")
+        if args.servo_place_in_box:
+            servo_arguments.append("--place-in-box")
         servo_arguments.extend(
-            ["--grasp-orientation", args.servo_grasp_orientation]
+            [
+                "--grasp-orientation",
+                args.servo_grasp_orientation,
+                "--target-policy",
+                args.servo_target_policy,
+            ]
         )
+        if args.seed is not None:
+            servo_arguments.extend(["--selection-seed", str(args.seed)])
         run_stage("visual_servo_runner.py", environment, servo_arguments)
 
 

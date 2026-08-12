@@ -23,3 +23,6 @@ visual_servo_6d_output/
 
 # Review-only external source copies, not part of the project.
 .codex_review/
+
+.rl_smoke_output/
+.rl_safe_smoke_output/

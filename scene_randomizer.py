@@ -58,6 +58,11 @@ SEPARATION_MARGIN_M = 0.008
 # 每个工件最多尝试多少次随机位置。
 MAX_PLACEMENT_TRIES = 3000
 
+# The randomizer is also used by the RL curriculum.  A rejection sampler can
+# spend all of its attempts in a narrow camera-visible strip even when a
+# simple grid arrangement exists, so keep a deterministic fallback budget.
+PLACEMENT_GRID_SIZE = 28
+
 # A layout can fail because an early random placement blocks the remaining
 # objects even when a valid arrangement exists. Retry the complete layout
 # while keeping the already generated object dimensions and classes fixed.
@@ -394,7 +399,34 @@ def check_candidate_camera_visibility(
 
     points_camera, pixels = projected
     bounds = camera_model["safe_bounds"]
-    if (
+    policy = str(camera_model.get("visibility_policy", "full")).lower()
+    if policy == "center":
+        # RL observations may contain partially occluded objects. Requiring
+        # every corner to be inside a narrow jaw-safe rectangle made the
+        # oblique camera reject nearly the whole physical workspace. Keep the
+        # object centre in the usable image and require the projected box to
+        # overlap the sensor at all.
+        centre_projection = project_base_points_to_image(
+            np.asarray([[x, y, z]], dtype=np.float64), camera_model
+        )
+        if centre_projection is None:
+            return None
+        centre_pixel = centre_projection[1][0]
+        if (
+            float(centre_pixel[0]) < bounds["u_min"]
+            or float(centre_pixel[0]) > bounds["u_max"]
+            or float(centre_pixel[1]) < bounds["v_min"]
+            or float(centre_pixel[1]) > bounds["v_max"]
+        ):
+            return None
+        if (
+            float(pixels[:, 0].max()) < 0.0
+            or float(pixels[:, 0].min()) > camera_model["width"] - 1
+            or float(pixels[:, 1].max()) < 0.0
+            or float(pixels[:, 1].min()) > camera_model["height"] - 1
+        ):
+            return None
+    elif (
         float(pixels[:, 0].min()) < bounds["u_min"]
         or float(pixels[:, 0].max()) > bounds["u_max"]
         or float(pixels[:, 1].min()) < bounds["v_min"]
@@ -965,6 +997,33 @@ def sample_non_overlapping_xy(
     overlap_rejections = 0
     visibility_rejections = 0
 
+    def accept_candidate(x_value: float, y_value: float) -> tuple[float, float, dict[str, Any]] | None:
+        nonlocal overlap_rejections, visibility_rejections
+        for other in placed_objects:
+            if oriented_footprints_overlap(
+                np.asarray([x_value, y_value], dtype=np.float64),
+                size_xyz,
+                yaw,
+                np.asarray(other["position"], dtype=np.float64),
+                other["size_xyz"],
+                other["yaw"],
+                clearance_m=clearance_m,
+            ):
+                overlap_rejections += 1
+                return None
+        visibility = check_candidate_camera_visibility(
+            x_value,
+            y_value,
+            table_z + size_xyz[2] / 2.0,
+            size_xyz,
+            yaw,
+            camera_model,
+        )
+        if visibility is None:
+            visibility_rejections += 1
+            return None
+        return x_value, y_value, visibility
+
     for _ in range(
         MAX_PLACEMENT_TRIES
     ):
@@ -978,34 +1037,21 @@ def sample_non_overlapping_xy(
             y_max,
         )
 
-        okay = True
+        accepted = accept_candidate(x, y)
+        if accepted is not None:
+            return accepted
 
-        for other in placed_objects:
-            if oriented_footprints_overlap(
-                np.asarray([x, y], dtype=np.float64),
-                size_xyz,
-                yaw,
-                np.asarray(other["position"], dtype=np.float64),
-                other["size_xyz"],
-                other["yaw"],
-                clearance_m=clearance_m,
-            ):
-                okay = False
-                overlap_rejections += 1
-                break
-
-        if okay:
-            visibility = check_candidate_camera_visibility(
-                x,
-                y,
-                table_z + size_xyz[2] / 2.0,
-                size_xyz,
-                yaw,
-                camera_model,
-            )
-            if visibility is not None:
-                return x, y, visibility
-            visibility_rejections += 1
+    # Rejection sampling is fast for a roomy view but unreliable for the
+    # current oblique camera.  Search a small shuffled grid before failing so
+    # training resets do not depend on luck or on the order of objects.
+    grid_x = np.linspace(x_min, x_max, max(2, PLACEMENT_GRID_SIZE))
+    grid_y = np.linspace(y_min, y_max, max(2, PLACEMENT_GRID_SIZE))
+    grid = [(float(x_value), float(y_value)) for x_value in grid_x for y_value in grid_y]
+    random.shuffle(grid)
+    for x, y in grid:
+        accepted = accept_candidate(x, y)
+        if accepted is not None:
+            return accepted
 
     raise RuntimeError(
         "\n在当前工作区内无法找到足够的非重叠位置。\n"
@@ -1143,22 +1189,17 @@ def _generate_separated_scene(
     )
 
     # 至少保证三类各出现一次。
-    classes = [
-        "cube",
-        "cuboid",
-        "cylinder",
-    ]
+    base_classes = ["cube", "cuboid", "cylinder"]
+    # Respect the requested count.  The previous fixed three-item list made
+    # curriculum stage A claim to generate one object while actually trying
+    # to place all three base classes.
+    if object_count <= len(base_classes):
+        classes = random.sample(base_classes, object_count)
+    else:
+        classes = base_classes[:]
 
     while len(classes) < object_count:
-        classes.append(
-            random.choice(
-                [
-                    "cube",
-                    "cuboid",
-                    "cylinder",
-                ]
-            )
-        )
+        classes.append(random.choice(base_classes))
 
     random.shuffle(
         classes

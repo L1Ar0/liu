@@ -110,6 +110,8 @@ class TargetObservation:
 def select_servo_target(
     recognition: dict[str, Any],
     requested_id: int | None = None,
+    policy: str = "auto",
+    random_seed: int | None = None,
 ) -> dict[str, Any]:
     objects = [
         item
@@ -123,6 +125,65 @@ def select_servo_target(
         raise RuntimeError(f"Prediction Object {requested_id} does not exist")
     if not objects:
         raise RuntimeError("Recognition output contains no pose-valid object")
+
+    policy_name = str(policy).strip().lower().replace("_", "-")
+    if policy_name in {"upper-random", "upper", "safe-random"}:
+        # A planned stack exposes the lower object as a valid primitive too,
+        # but its grasp_planning metadata marks it blocked.  Restrict the
+        # automatic policy to topmost, unblocked candidates before applying
+        # the class preference.  The height band makes an actual stack top
+        # win over unrelated table-only parts at lower Z.
+        candidates = [
+            item
+            for item in objects
+            if bool(item.get("grasp_planning", {}).get("topmost", False))
+            and not bool(item.get("grasp_planning", {}).get("grasp_blocked", False))
+        ]
+        if not candidates:
+            candidates = [
+                item
+                for item in objects
+                if not bool(item.get("grasp_planning", {}).get("grasp_blocked", False))
+            ]
+        if not candidates:
+            candidates = list(objects)
+
+        non_sphere = [
+            item for item in candidates
+            if str(item.get("class", "")).lower() != "sphere"
+        ]
+        if non_sphere:
+            candidates = non_sphere
+
+        # Tapered cones are especially sensitive to partial visibility.  Keep
+        # them available when they are the only valid workpiece, but do not
+        # choose a low-confidence cone over a well-observed alternative during
+        # automatic grasp selection.
+        quality_safe = [
+            item
+            for item in candidates
+            if str(item.get("class", "")).lower() != "cone"
+            or float(item.get("confidence", 0.0)) >= 0.40
+        ]
+        if quality_safe:
+            candidates = quality_safe
+
+        heights = [
+            float(np.asarray(item.get("center_m", [0.0, 0.0, 0.0]))[2])
+            for item in candidates
+        ]
+        highest = max(heights)
+        upper_band = [
+            item
+            for item in candidates
+            if highest
+            - float(np.asarray(item.get("center_m", [0.0, 0.0, 0.0]))[2])
+            <= 0.012
+        ]
+        candidates = upper_band or candidates
+        ordered = sorted(candidates, key=lambda item: int(item.get("id", -1)))
+        rng = np.random.default_rng(random_seed)
+        return ordered[int(rng.integers(0, len(ordered)))]
 
     def score(item: dict[str, Any]) -> float:
         planning = dict(item.get("grasp_planning", {}))
