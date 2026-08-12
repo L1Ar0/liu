@@ -11,6 +11,7 @@ from primitive_fitting import fit_primitive_candidates
 from shape_catalog import CAD_DIMENSIONS_M, get_cad_dimensions
 from grasp_planning import annotate_grasp_planning
 from depth_grasp_rl import action_reward, encode_action, normalize_depth
+from end_to_end_grasp_env import STAGE_CONFIGS, pregrasp_target_point, stage_task_success
 from planned_scene_randomizer import _obb_penetrates, build_planned_layout
 
 
@@ -115,6 +116,17 @@ class PrimitiveFittingTests(unittest.TestCase):
 
 
 class ExchangeContractTests(unittest.TestCase):
+    def test_curriculum_success_is_stage_specific(self) -> None:
+        self.assertTrue(stage_task_success("A", grasp_success=False, stage_contact_success=False, stage_distance_success=True))
+        self.assertFalse(stage_task_success("D", grasp_success=False, stage_contact_success=False, stage_distance_success=True))
+        self.assertTrue(stage_task_success("C", grasp_success=False, stage_contact_success=True, stage_distance_success=False))
+        self.assertFalse(stage_task_success("E", grasp_success=False, stage_contact_success=True, stage_distance_success=True))
+
+    def test_pregrasp_point_is_above_object_extent(self) -> None:
+        point = pregrasp_target_point(np.asarray([0.0, 0.0, 0.02]), [0.04, 0.04, 0.04], standoff_m=0.07)
+        self.assertAlmostEqual(float(point[2]), 0.11, places=6)
+        self.assertEqual(STAGE_CONFIGS["D"].action_mask, (1, 1, 1, 0, 0, 1, 1))
+
     def test_cad_dimensions_exist(self) -> None:
         for cad_id, dimensions in CAD_DIMENSIONS_M.items():
             self.assertEqual(get_cad_dimensions(cad_id), dimensions)

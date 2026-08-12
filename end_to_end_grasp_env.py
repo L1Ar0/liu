@@ -65,6 +65,7 @@ class StageConfig:
     timeout_penalty: float
     premature_close_penalty: float
     allows_connector: bool
+    inactive_action_penalty: float = 0.03
 
 
 CURRICULUM_STAGES = ("A", "B", "C", "D", "E")
@@ -77,7 +78,7 @@ STAGE_CONFIGS = {
     # C: top-down translation/yaw plus gripper; bilateral contact ends the task.
     "C": StageConfig(1, (1, 1, 1, 0, 0, 1, 1), "grasp", 0.075, 1.00, 1.0, 0.015, 0.01, 4.0, 4.0, 6.0, 2.0, 12.0, 0.0, 0.0, 40.0, 10.0, 1.0, False),
     # D: complete single-object connector grasp and lift.
-    "D": StageConfig(1, (1, 1, 1, 1, 1, 1, 1), "grasp", 0.075, 0.75, 0.75, 0.02, 0.01, 5.0, 5.0, 8.0, 2.0, 8.0, 20.0, 4.0, 100.0, 15.0, 1.0, True),
+    "D": StageConfig(1, (1, 1, 1, 0, 0, 1, 1), "grasp", 0.075, 0.75, 0.75, 0.02, 0.01, 5.0, 5.0, 8.0, 2.0, 8.0, 20.0, 4.0, 100.0, 15.0, 1.0, True),
     # E: the same task in multi-object, stacked, occluded and noisy scenes.
     "E": StageConfig(None, (1, 1, 1, 1, 1, 1, 1), "grasp", 0.075, 0.60, 0.60, 0.025, 0.02, 7.5, 6.0, 10.0, 2.0, 8.0, 25.0, 5.0, 120.0, 20.0, 1.5, True),
 }
@@ -88,6 +89,39 @@ def curriculum_stage_config(stage: str) -> StageConfig:
     if value not in STAGE_CONFIGS:
         raise ValueError(f"Unknown curriculum stage: {stage}")
     return STAGE_CONFIGS[value]
+
+
+def stage_task_success(
+    stage: str,
+    *,
+    grasp_success: bool,
+    stage_contact_success: bool,
+    stage_distance_success: bool,
+) -> bool:
+    """Map the physical event to the curriculum objective for one episode."""
+    value = str(stage).upper()
+    if value in {"A", "B"}:
+        return bool(stage_distance_success)
+    if value == "C":
+        return bool(stage_contact_success)
+    return bool(grasp_success)
+
+
+def pregrasp_target_point(
+    center: np.ndarray,
+    size_m: np.ndarray | list[float] | tuple[float, ...],
+    rotation_matrix: np.ndarray | None = None,
+    standoff_m: float = 0.07,
+) -> np.ndarray:
+    """Return a point above an object's highest world-Z extent."""
+    center_value = np.asarray(center, dtype=np.float64).reshape(3)
+    size_value = np.asarray(size_m, dtype=np.float64).reshape(3)
+    if rotation_matrix is None:
+        rotation = np.eye(3, dtype=np.float64)
+    else:
+        rotation = np.asarray(rotation_matrix, dtype=np.float64).reshape(3, 3)
+    half_height = 0.5 * float(np.sum(np.abs(rotation[2, :]) * size_value))
+    return center_value + np.asarray([0.0, 0.0, half_height + max(0.0, float(standoff_m))])
 
 
 if gym is None:
@@ -162,6 +196,8 @@ else:
             self._depth_noise_std_m = 0.0
             self._robot_shape_flags: list[tuple[int, int, int]] = []
             self.episode_target_handle: int | None = None
+            self.object_records: list[dict[str, Any]] = []
+            self._records_by_handle: dict[int, dict[str, Any]] = {}
             self._stage_reference_distance = 0.0
 
             self.action_space = spaces.Box(-1.0, 1.0, shape=(ACTION_DIM,), dtype=np.float32)
@@ -322,12 +358,19 @@ else:
                     planned_randomizer.PLANNED_OBJECT_COUNT = original_planned_count
             records = self._apply_curriculum_object_count(records, seed)
             self.object_handles = [int(item["handle"]) for item in records if "handle" in item]
+            self.object_records = list(records)
+            self._records_by_handle = {
+                int(item["handle"]): item for item in records if "handle" in item
+            }
             if not self.object_handles:
                 raise RuntimeError("Randomizer returned no usable object handles")
-            target_rng = np.random.default_rng(seed)
-            self.episode_target_handle = int(
-                self.object_handles[int(target_rng.integers(len(self.object_handles)))]
-            )
+            # Stages A-D intentionally use a fixed, observable-by-training-task
+            # single target. E is multi-object: a hidden random id would make the
+            # task partially unobservable, so shaping and contact scan all objects.
+            if self.curriculum_stage == "E":
+                self.episode_target_handle = None
+            else:
+                self.episode_target_handle = int(self.object_handles[0])
             if effective_mode.lower() in {"physics", "dynamic", "settled", "drop"} and self.execution_mode == "dynamic":
                 self._set_dynamic_scene_flags()
                 self._randomize_object_dynamics(seed)
@@ -690,19 +733,47 @@ else:
             ).astype(np.float32)
             return {"depth": depth_state.astype(np.float32), "proprio": proprio}
 
+        def _stage_target_point(self, handle: int) -> np.ndarray | None:
+            try:
+                center = np.asarray(self.sim.getObjectPosition(handle, self.robot_base), dtype=np.float64)
+            except Exception:
+                return None
+            if curriculum_stage_config(self.curriculum_stage).distance_mode != "pregrasp":
+                return center
+            record = self._records_by_handle.get(int(handle), {})
+            size = record.get("size_m", [0.04, 0.04, 0.04])
+            rotation = record.get("rotation_matrix")
+            return pregrasp_target_point(center, size, rotation)
+
+        def _distance_to_handle(self, handle: int, tip: np.ndarray) -> float:
+            target = self._stage_target_point(handle)
+            if target is None:
+                return float("inf")
+            if curriculum_stage_config(self.curriculum_stage).distance_mode == "lateral":
+                return float(np.linalg.norm(tip[:2] - target[:2]))
+            return float(np.linalg.norm(tip - target))
+
         def _target_distance(self) -> float:
-            """Return a fixed-target distance for dense shaping and stage checks."""
-            handle = self.episode_target_handle
-            if handle is None or self.tip is None or self.robot_base is None:
+            """Return target distance, using a smooth minimum for multi-object E."""
+            if self.tip is None or self.robot_base is None or not self.object_handles:
                 return float("inf")
             try:
                 tip = np.asarray(self.sim.getObjectPosition(self.tip, self.robot_base), dtype=np.float64)
-                center = np.asarray(self.sim.getObjectPosition(handle, self.robot_base), dtype=np.float64)
             except Exception:
                 return float("inf")
-            if curriculum_stage_config(self.curriculum_stage).distance_mode == "lateral":
-                return float(np.linalg.norm(tip[:2] - center[:2]))
-            return float(np.linalg.norm(tip - center))
+            handles = ([self.episode_target_handle]
+                       if self.episode_target_handle is not None
+                       else list(self.object_handles))
+            distances = [self._distance_to_handle(int(handle), tip) for handle in handles if handle is not None]
+            distances = [value for value in distances if math.isfinite(value)]
+            if not distances:
+                return float("inf")
+            if self.curriculum_stage == "E" and len(distances) > 1:
+                tau = 0.02
+                values = np.asarray(distances, dtype=np.float64)
+                minimum = float(values.min())
+                return float(max(0.0, minimum - tau * np.log(np.exp(-(values - minimum) / tau).sum())))
+            return float(distances[0])
 
         def _nearest_object(self) -> tuple[int | None, float]:
             if self.tip is None or not self.object_handles:
@@ -879,10 +950,12 @@ else:
             if self.ik is None:
                 raise RuntimeError("reset() must be called before step()")
             config = curriculum_stage_config(self.curriculum_stage)
-            raw_action = np.asarray(action, dtype=np.float32).reshape(ACTION_DIM)
-            raw_action = np.clip(raw_action, -1.0, 1.0)
-            raw_action = raw_action * np.asarray(config.action_mask, dtype=np.float32)
-            translation, rotvec, gripper = decode_cartesian_action(raw_action)
+            policy_action = np.asarray(action, dtype=np.float32).reshape(ACTION_DIM)
+            policy_action = np.clip(policy_action, -1.0, 1.0)
+            action_mask = np.asarray(config.action_mask, dtype=np.float32)
+            inactive_action = policy_action * (1.0 - action_mask)
+            executed_action = policy_action * action_mask
+            translation, rotvec, gripper = decode_cartesian_action(executed_action)
             current = self.ik.current_pose()
             target = current.copy()
             target[:3, 3] += translation
@@ -939,8 +1012,12 @@ else:
             )
             stage_contact_success = (
                 self.curriculum_stage == "C"
+                and candidate is not None
                 and bilateral
                 and self._gripper_state > 0.0
+                and self._between_fingers(candidate)
+                and tcp_to_object <= config.distance_tolerance_m
+                and not self._table_collision()
             )
             lift = self._lift_progress()
             if lift >= 0.015:
@@ -950,7 +1027,7 @@ else:
             grasp_success = self.attached_handle is not None and self._lift_hold_count >= 3
             dropped = released or (self.attached_handle is not None and self._gripper_state < 0.0)
             joint_limit = self._joint_limit_violation()
-            smoothness = float(np.mean(np.square(raw_action - self._previous_action)))
+            smoothness = float(np.mean(np.square(executed_action - self._previous_action)))
             approach_progress = float(np.clip(distance_progress / max(TRANSLATION_STEP_M, 1e-6), -1.0, 1.0))
             reward = config.approach_gain * approach_progress
             reward = float(np.clip(reward, -config.approach_clip, config.approach_clip))
@@ -959,6 +1036,7 @@ else:
             reward -= config.collision_penalty if collision or self._table_collision() else 0.0
             reward -= config.ik_penalty if ik_failed else 0.0
             reward -= config.joint_limit_penalty if joint_limit else 0.0
+            reward -= config.inactive_action_penalty * float(np.mean(np.square(inactive_action)))
             if left_hit and not self._previous_left_contact:
                 reward += config.one_side_contact_reward
             if right_hit and not self._previous_right_contact:
@@ -971,21 +1049,23 @@ else:
             lift_progress = max(0.0, lift - self._previous_lift)
             reward += config.lift_progress_gain * min(lift_progress / 0.015, 1.0)
             self._previous_lift = lift
-            reward += config.success_reward if (
-                grasp_success or stage_contact_success or stage_distance_success
-            ) else 0.0
+            task_success = stage_task_success(
+                self.curriculum_stage,
+                grasp_success=grasp_success,
+                stage_contact_success=stage_contact_success,
+                stage_distance_success=stage_distance_success,
+            )
+            reward += config.success_reward if task_success else 0.0
             reward -= config.premature_close_penalty if (
                 self._gripper_state > 0.0 and not bilateral and self.curriculum_stage in {"A", "B"}
             ) else 0.0
             self._previous_left_contact = left_hit
             self._previous_right_contact = right_hit
-            self._previous_action = np.clip(raw_action, -1.0, 1.0)
+            self._previous_action = np.clip(executed_action, -1.0, 1.0)
             self._step_count += 1
             terminated = bool(
                 dropped
-                or grasp_success
-                or (self.curriculum_stage in {"A", "B"} and stage_distance_success)
-                or stage_contact_success
+                or task_success
             )
             truncated = bool(not terminated and self._step_count >= self.max_steps)
             if truncated:
@@ -1008,6 +1088,8 @@ else:
                 "target_handle": self.episode_target_handle,
                 "stage_distance_success": stage_distance_success,
                 "stage_contact_success": stage_contact_success,
+                "task_success": task_success,
+                "inactive_action_norm": float(np.linalg.norm(inactive_action)),
             }
             return self._capture_observation(), float(reward), terminated, truncated, info
 

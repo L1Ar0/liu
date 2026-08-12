@@ -35,9 +35,11 @@ def parse_args() -> argparse.Namespace:
         help="RL execution: freeze after physics reset (default), pure kinematic, or experimental dynamic rollout",
     )
     parser.add_argument("--seed", type=int, default=20260811)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--n-steps", type=int, default=256)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--n-steps", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--clip-range", type=float, default=0.1)
+    parser.add_argument("--ent-coef", type=float, default=0.001)
     parser.add_argument("--output-dir", type=Path, default=Path("end_to_end_grasp_rl_output"))
     parser.add_argument(
         "--resume",
@@ -162,8 +164,8 @@ def main() -> int:
             batch_size=int(args.batch_size),
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=0.2,
-            ent_coef=0.005,
+            clip_range=float(args.clip_range),
+            ent_coef=float(args.ent_coef),
             vf_coef=0.5,
             max_grad_norm=0.5,
             tensorboard_log=tensorboard_log,
@@ -186,7 +188,7 @@ def main() -> int:
         "stage": args.stage,
         "resume": str(args.resume.resolve()) if args.resume is not None else None,
         "seed": int(args.seed),
-        "observation": "128x128 normalized depth + 7 joint positions + 7 joint velocities + gripper + previous action",
+        "observation": "128x128 normalized depth + 7 joint positions + 7 joint velocities + gripper + previous executed action + 5-stage one-hot (27 proprio values)",
         "action": ["dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper"],
         "execution_note": "settle_then_kinematic uses dynamics only to settle reset scenes; PPO rollout uses IK and connector proxy",
         "ground_truth_in_observation": False,

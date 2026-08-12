@@ -62,13 +62,20 @@ def main() -> int:
                 total_reward += float(reward)
         finally:
             env.close()
+        stage_success = {
+            "A": bool(last_info.get("stage_distance_success", False)),
+            "B": bool(last_info.get("stage_distance_success", False)),
+            "C": bool(last_info.get("stage_contact_success", False)),
+            "D": bool(last_info.get("grasp_success", False)),
+            "E": bool(last_info.get("grasp_success", False)),
+        }.get(args.stage, bool(last_info.get("grasp_success", False)))
         results.append(
             {
                 "episode": episode,
                 "return": total_reward,
                 "terminated": bool(terminated),
                 "truncated": bool(truncated),
-                "success": bool(last_info.get("grasp_success", False)),
+                "success": stage_success,
                 "last_info": last_info,
             }
         )

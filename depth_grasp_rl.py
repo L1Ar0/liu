@@ -125,14 +125,14 @@ if torch is not None:
                 nn.ReLU(),
                 nn.Conv2d(64, 128, 3, stride=2, padding=1),
                 nn.ReLU(),
-                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.AdaptiveAvgPool2d((4, 4)),
                 nn.Flatten(),
             )
             # The standalone actor-critic remains useful for lightweight
             # experiments.  End-to-end SB3 training uses the Dict extractor
             # below, which also consumes robot state.
-            self.actor = nn.Sequential(nn.Linear(128, 128), nn.Tanh(), nn.Linear(128, action_dim))
-            self.critic = nn.Sequential(nn.Linear(128, 128), nn.Tanh(), nn.Linear(128, 1))
+            self.actor = nn.Sequential(nn.Linear(128 * 4 * 4, 128), nn.Tanh(), nn.Linear(128, action_dim))
+            self.critic = nn.Sequential(nn.Linear(128 * 4 * 4, 128), nn.Tanh(), nn.Linear(128, 1))
             self.log_std = nn.Parameter(torch.full((action_dim,), -1.0))
 
         def forward(self, state: Any) -> tuple[Any, Any, Any]:
@@ -184,7 +184,7 @@ if torch is not None:
                     nn.ReLU(),
                     nn.Conv2d(64, 128, 3, stride=2, padding=1),
                     nn.ReLU(),
-                    nn.AdaptiveAvgPool2d((1, 1)),
+                    nn.AdaptiveAvgPool2d((4, 4)),
                     nn.Flatten(),
                 )
                 with torch.no_grad():
