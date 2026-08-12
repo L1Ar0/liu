@@ -39,6 +39,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-steps", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--output-dir", type=Path, default=Path("end_to_end_grasp_rl_output"))
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="resume PPO weights from a previous stage checkpoint",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--checkpoint-freq", type=int, default=100_000)
     parser.add_argument("--curriculum", action=argparse.BooleanOptionalAction, default=True)
@@ -141,24 +147,30 @@ def main() -> int:
                 "'.venv\\Scripts\\python.exe -m pip install tensorboard'。",
                 flush=True,
             )
-    model = PPO(
-        "MultiInputPolicy",
-        env,
-        policy_kwargs=policy_kwargs,
-        learning_rate=float(args.learning_rate),
-        n_steps=int(args.n_steps),
-        batch_size=int(args.batch_size),
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.005,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        tensorboard_log=tensorboard_log,
-        seed=int(args.seed),
-        device=args.device,
-        verbose=1,
-    )
+    if args.resume is not None:
+        if not args.resume.exists() and not Path(f"{args.resume}.zip").exists():
+            raise SystemExit(f"Resume checkpoint does not exist: {args.resume}")
+        model = PPO.load(str(args.resume), env=env, device=args.device)
+        print(f"Resumed PPO checkpoint: {args.resume.resolve()}", flush=True)
+    else:
+        model = PPO(
+            "MultiInputPolicy",
+            env,
+            policy_kwargs=policy_kwargs,
+            learning_rate=float(args.learning_rate),
+            n_steps=int(args.n_steps),
+            batch_size=int(args.batch_size),
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=0.005,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            tensorboard_log=tensorboard_log,
+            seed=int(args.seed),
+            device=args.device,
+            verbose=1,
+        )
     model.learn(total_timesteps=int(args.timesteps), callback=callbacks, progress_bar=False)
     model.save(str(output_dir / "ppo_grasp_final"))
     summary = {
@@ -172,6 +184,7 @@ def main() -> int:
         "planned_layout": args.planned_layout,
         "curriculum": bool(args.curriculum),
         "stage": args.stage,
+        "resume": str(args.resume.resolve()) if args.resume is not None else None,
         "seed": int(args.seed),
         "observation": "128x128 normalized depth + 7 joint positions + 7 joint velocities + gripper + previous action",
         "action": ["dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper"],
