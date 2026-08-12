@@ -15,6 +15,7 @@ import math
 import os
 import random
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,52 @@ from depth_grasp_rl import (
 
 ROOT = Path(__file__).resolve().parent
 OBSERVATION_POSE_FILE = ROOT / "camera_output" / "initial_observation_joints.json"
+
+
+@dataclass(frozen=True)
+class StageConfig:
+    object_count: int | None
+    action_mask: tuple[float, ...]
+    distance_mode: str
+    distance_tolerance_m: float
+    approach_gain: float
+    approach_clip: float
+    smoothness_weight: float
+    step_penalty: float
+    collision_penalty: float
+    ik_penalty: float
+    joint_limit_penalty: float
+    one_side_contact_reward: float
+    bilateral_reward: float
+    connector_reward: float
+    lift_progress_gain: float
+    success_reward: float
+    timeout_penalty: float
+    premature_close_penalty: float
+    allows_connector: bool
+
+
+CURRICULUM_STAGES = ("A", "B", "C", "D", "E")
+STAGE_INDEX = {stage: index for index, stage in enumerate(CURRICULUM_STAGES)}
+STAGE_CONFIGS = {
+    # A: lateral alignment only. Z, rotation and gripper commands are masked.
+    "A": StageConfig(1, (1, 1, 0, 0, 0, 0, 0), "lateral", 0.025, 1.00, 1.0, 0.01, 0.01, 2.0, 2.0, 4.0, 0.0, 0.0, 0.0, 0.0, 15.0, 5.0, 0.0, False),
+    # B: move in XYZ to a collision-free point above the object.
+    "B": StageConfig(1, (1, 1, 1, 0, 0, 0, 0), "pregrasp", 0.018, 1.25, 1.25, 0.01, 0.01, 3.0, 3.0, 5.0, 0.0, 0.0, 0.0, 0.0, 25.0, 7.5, 0.0, False),
+    # C: top-down translation/yaw plus gripper; bilateral contact ends the task.
+    "C": StageConfig(1, (1, 1, 1, 0, 0, 1, 1), "grasp", 0.075, 1.00, 1.0, 0.015, 0.01, 4.0, 4.0, 6.0, 2.0, 12.0, 0.0, 0.0, 40.0, 10.0, 1.0, False),
+    # D: complete single-object connector grasp and lift.
+    "D": StageConfig(1, (1, 1, 1, 1, 1, 1, 1), "grasp", 0.075, 0.75, 0.75, 0.02, 0.01, 5.0, 5.0, 8.0, 2.0, 8.0, 20.0, 4.0, 100.0, 15.0, 1.0, True),
+    # E: the same task in multi-object, stacked, occluded and noisy scenes.
+    "E": StageConfig(None, (1, 1, 1, 1, 1, 1, 1), "grasp", 0.075, 0.60, 0.60, 0.025, 0.02, 7.5, 6.0, 10.0, 2.0, 8.0, 25.0, 5.0, 120.0, 20.0, 1.5, True),
+}
+
+
+def curriculum_stage_config(stage: str) -> StageConfig:
+    value = str(stage).upper()
+    if value not in STAGE_CONFIGS:
+        raise ValueError(f"Unknown curriculum stage: {stage}")
+    return STAGE_CONFIGS[value]
 
 
 if gym is None:
@@ -80,6 +127,9 @@ else:
             self.connector_enabled = bool(connector_enabled)
             self.headless = bool(headless)
             self.curriculum_stage = str(curriculum_stage).upper()
+            if self.curriculum_stage not in STAGE_CONFIGS:
+                raise ValueError("Curriculum stage must be A, B, C, D, or E")
+            self._pending_curriculum_stage = self.curriculum_stage
             self.execution_mode = self._normalize_execution_mode(execution_mode)
             self._seed = seed
             self._base_seed = seed
@@ -106,15 +156,20 @@ else:
             self._gripper_state = 0.0
             self._step_count = 0
             self._lift_hold_count = 0
+            self._previous_lift = 0.0
+            self._previous_left_contact = False
+            self._previous_right_contact = False
             self._depth_noise_std_m = 0.0
             self._robot_shape_flags: list[tuple[int, int, int]] = []
+            self.episode_target_handle: int | None = None
+            self._stage_reference_distance = 0.0
 
             self.action_space = spaces.Box(-1.0, 1.0, shape=(ACTION_DIM,), dtype=np.float32)
             self.observation_space = spaces.Dict(
                 {
                     "depth": spaces.Box(0.0, 1.0, shape=(1, self.image_size, self.image_size), dtype=np.float32),
-                    # q(7), dq(7), gripper(1), previous action(7)
-                    "proprio": spaces.Box(-1.0, 1.0, shape=(22,), dtype=np.float32),
+                    # q(7), dq(7), gripper(1), previous action(7), stage one-hot(5)
+                    "proprio": spaces.Box(-1.0, 1.0, shape=(27,), dtype=np.float32),
                 }
             )
 
@@ -222,7 +277,7 @@ else:
             original_max_objects = randomizer.MAX_OBJECTS
             original_planned_count = None
             if effective_mode == "separated":
-                curriculum_count = {"A": 1, "B": 2}.get(self.curriculum_stage)
+                curriculum_count = curriculum_stage_config(self.curriculum_stage).object_count
                 if curriculum_count is not None:
                     randomizer.MIN_OBJECTS = curriculum_count
                     randomizer.MAX_OBJECTS = curriculum_count
@@ -267,6 +322,12 @@ else:
                     planned_randomizer.PLANNED_OBJECT_COUNT = original_planned_count
             records = self._apply_curriculum_object_count(records, seed)
             self.object_handles = [int(item["handle"]) for item in records if "handle" in item]
+            if not self.object_handles:
+                raise RuntimeError("Randomizer returned no usable object handles")
+            target_rng = np.random.default_rng(seed)
+            self.episode_target_handle = int(
+                self.object_handles[int(target_rng.integers(len(self.object_handles)))]
+            )
             if effective_mode.lower() in {"physics", "dynamic", "settled", "drop"} and self.execution_mode == "dynamic":
                 self._set_dynamic_scene_flags()
                 self._randomize_object_dynamics(seed)
@@ -309,9 +370,9 @@ else:
 
         def set_curriculum_stage(self, stage: str) -> None:
             value = str(stage).upper()
-            if value not in {"A", "B", "C", "D", "E"}:
+            if value not in STAGE_CONFIGS:
                 raise ValueError("Curriculum stage must be A, B, C, D, or E")
-            self.curriculum_stage = value
+            self._pending_curriculum_stage = value
 
         def _curriculum_scene(self, seed: int | None) -> tuple[str, str | None]:
             rng = np.random.default_rng(seed)
@@ -322,22 +383,26 @@ else:
             if stage == "B":
                 return "separated", None
             if stage == "C":
-                return "planned", str(rng.choice(["table_only", "stack"]))
+                return "separated", None
             if stage == "D":
-                return "planned", str(rng.choice(["leaning", "bridge", "partial_support"]))
+                return "separated", None
             self._depth_noise_std_m = 0.002
             return self.scene_mode, self.planned_layout
 
         def _apply_curriculum_object_count(self, records: list[dict[str, Any]], seed: int | None) -> list[dict[str, Any]]:
-            if self.curriculum_stage != "A" or len(records) <= 1:
+            requested_count = curriculum_stage_config(self.curriculum_stage).object_count
+            if requested_count is None or len(records) <= requested_count:
                 return records
             rng = np.random.default_rng(seed)
             simple = [item for item in records if str(item.get("class", "")) in {"cube", "cylinder"}]
-            keep = simple[int(rng.integers(len(simple)))] if simple else records[0]
-            remove = [int(item["handle"]) for item in records if item is not keep and "handle" in item]
+            candidates = simple if len(simple) >= requested_count else records
+            selected_indices = rng.choice(len(candidates), size=requested_count, replace=False)
+            selected = [candidates[int(index)] for index in np.atleast_1d(selected_indices)]
+            selected_ids = {id(item) for item in selected}
+            remove = [int(item["handle"]) for item in records if id(item) not in selected_ids and "handle" in item]
             if remove:
                 self.sim.removeObjects(remove)
-            return [keep]
+            return selected
 
         def _randomize_object_dynamics(self, seed: int | None) -> None:
             rng = np.random.default_rng(seed)
@@ -618,8 +683,26 @@ else:
                     velocities.append(0.0)
             q_state = np.clip(q / math.pi, -1.0, 1.0)
             dq_state = np.clip(np.asarray(velocities, dtype=np.float64) / 10.0, -1.0, 1.0)
-            proprio = np.concatenate((q_state, dq_state, [self._gripper_state], self._previous_action)).astype(np.float32)
+            stage_one_hot = np.zeros(len(CURRICULUM_STAGES), dtype=np.float64)
+            stage_one_hot[STAGE_INDEX[self.curriculum_stage]] = 1.0
+            proprio = np.concatenate(
+                (q_state, dq_state, [self._gripper_state], self._previous_action, stage_one_hot)
+            ).astype(np.float32)
             return {"depth": depth_state.astype(np.float32), "proprio": proprio}
+
+        def _target_distance(self) -> float:
+            """Return a fixed-target distance for dense shaping and stage checks."""
+            handle = self.episode_target_handle
+            if handle is None or self.tip is None or self.robot_base is None:
+                return float("inf")
+            try:
+                tip = np.asarray(self.sim.getObjectPosition(self.tip, self.robot_base), dtype=np.float64)
+                center = np.asarray(self.sim.getObjectPosition(handle, self.robot_base), dtype=np.float64)
+            except Exception:
+                return float("inf")
+            if curriculum_stage_config(self.curriculum_stage).distance_mode == "lateral":
+                return float(np.linalg.norm(tip[:2] - center[:2]))
+            return float(np.linalg.norm(tip - center))
 
         def _nearest_object(self) -> tuple[int | None, float]:
             if self.tip is None or not self.object_handles:
@@ -632,7 +715,14 @@ else:
                 except Exception:
                     pass
             best: tuple[int | None, float] = (None, float("inf"))
-            for handle in list(self.object_handles):
+            handles = (
+                [self.episode_target_handle]
+                if self.episode_target_handle is not None
+                else list(self.object_handles)
+            )
+            for handle in handles:
+                if handle is None:
+                    continue
                 try:
                     if self.sim.getObjectParent(handle) == self.tip or handle == self.attached_handle:
                         continue
@@ -665,7 +755,14 @@ else:
             if not left or not right:
                 return None, False, False
             best: tuple[int | None, bool, bool] = (None, False, False)
-            for handle in self.object_handles:
+            handles = (
+                [self.episode_target_handle]
+                if self.episode_target_handle is not None
+                else list(self.object_handles)
+            )
+            for handle in handles:
+                if handle is None:
+                    continue
                 left_hit = any(self._collision(finger, handle) for finger in left)
                 right_hit = any(self._collision(finger, handle) for finger in right)
                 if left_hit and right_hit:
@@ -745,9 +842,14 @@ else:
             super().reset(seed=int(seed))
             self._seed = seed
             self._previous_action.fill(0.0)
+            if self._pending_curriculum_stage != self.curriculum_stage:
+                self.curriculum_stage = self._pending_curriculum_stage
             self._gripper_state = 0.0
             self._step_count = 0
             self._lift_hold_count = 0
+            self._previous_lift = 0.0
+            self._previous_left_contact = False
+            self._previous_right_contact = False
             self.connector_handle = None
             self.attached_handle = None
             self.attached_initial_z = None
@@ -759,7 +861,8 @@ else:
                 self.ik = None
             self._connect()
             self._load_scene(seed)
-            _handle, distance = self._nearest_object()
+            _handle, _ = self._nearest_object()
+            distance = self._target_distance()
             self._previous_distance = distance
             return self._capture_observation(), {
                 "object_count": len(self.object_handles),
@@ -768,12 +871,17 @@ else:
                 "arm_control": "kinematic_ik",
                 "rollout_dynamics": self.execution_mode == "dynamic",
                 "grasp_proxy": "connector" if self.connector_enabled else "none",
+                "curriculum_stage": self.curriculum_stage,
+                "target_handle_hidden": True,
             }
 
         def step(self, action: np.ndarray) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
             if self.ik is None:
                 raise RuntimeError("reset() must be called before step()")
+            config = curriculum_stage_config(self.curriculum_stage)
             raw_action = np.asarray(action, dtype=np.float32).reshape(ACTION_DIM)
+            raw_action = np.clip(raw_action, -1.0, 1.0)
+            raw_action = raw_action * np.asarray(config.action_mask, dtype=np.float32)
             translation, rotvec, gripper = decode_cartesian_action(raw_action)
             current = self.ik.current_pose()
             target = current.copy()
@@ -808,7 +916,9 @@ else:
             bilateral = bool(left_hit and right_hit)
             connector_created = False
             if (
-                self._gripper_state > 0.0
+                config.allows_connector
+                and self._gripper_state > 0.0
+                and self.curriculum_stage in {"D", "E"}
                 and bilateral
                 and candidate is not None
                 and self._between_fingers(candidate)
@@ -819,9 +929,19 @@ else:
                     self._attach(candidate)
                     connector_created = self.attached_handle is not None
 
-            _nearest, distance = self._nearest_object()
+            _nearest, _ = self._nearest_object()
+            distance = self._target_distance()
             distance_progress = 0.0 if not math.isfinite(self._previous_distance) else self._previous_distance - distance
             self._previous_distance = distance
+            stage_distance_success = (
+                distance <= config.distance_tolerance_m
+                and self._step_count >= 2
+            )
+            stage_contact_success = (
+                self.curriculum_stage == "C"
+                and bilateral
+                and self._gripper_state > 0.0
+            )
             lift = self._lift_progress()
             if lift >= 0.015:
                 self._lift_hold_count += 1
@@ -831,22 +951,45 @@ else:
             dropped = released or (self.attached_handle is not None and self._gripper_state < 0.0)
             joint_limit = self._joint_limit_violation()
             smoothness = float(np.mean(np.square(raw_action - self._previous_action)))
-            reward = 40.0 * distance_progress - 0.02 * smoothness
-            reward -= 5.0 if collision or self._table_collision() else 0.0
-            reward -= 5.0 if ik_failed else 0.0
-            reward -= 10.0 if joint_limit else 0.0
-            reward += 10.0 if bilateral and self._gripper_state > 0.0 else 0.0
-            reward += 20.0 if connector_created else 0.0
-            reward += 30.0 * min(lift / 0.015, 1.0)
-            reward += 50.0 if self._lift_hold_count >= 3 else 0.0
-            reward += 100.0 if grasp_success else 0.0
-            reward -= 50.0 if dropped else 0.0
+            approach_progress = float(np.clip(distance_progress / max(TRANSLATION_STEP_M, 1e-6), -1.0, 1.0))
+            reward = config.approach_gain * approach_progress
+            reward = float(np.clip(reward, -config.approach_clip, config.approach_clip))
+            reward -= config.smoothness_weight * smoothness
+            reward -= config.step_penalty
+            reward -= config.collision_penalty if collision or self._table_collision() else 0.0
+            reward -= config.ik_penalty if ik_failed else 0.0
+            reward -= config.joint_limit_penalty if joint_limit else 0.0
+            if left_hit and not self._previous_left_contact:
+                reward += config.one_side_contact_reward
+            if right_hit and not self._previous_right_contact:
+                reward += config.one_side_contact_reward
+            if bilateral and self._gripper_state > 0.0 and not (
+                self._previous_left_contact and self._previous_right_contact
+            ):
+                reward += config.bilateral_reward
+            reward += config.connector_reward if connector_created else 0.0
+            lift_progress = max(0.0, lift - self._previous_lift)
+            reward += config.lift_progress_gain * min(lift_progress / 0.015, 1.0)
+            self._previous_lift = lift
+            reward += config.success_reward if (
+                grasp_success or stage_contact_success or stage_distance_success
+            ) else 0.0
+            reward -= config.premature_close_penalty if (
+                self._gripper_state > 0.0 and not bilateral and self.curriculum_stage in {"A", "B"}
+            ) else 0.0
+            self._previous_left_contact = left_hit
+            self._previous_right_contact = right_hit
             self._previous_action = np.clip(raw_action, -1.0, 1.0)
             self._step_count += 1
-            terminated = bool(grasp_success or dropped)
+            terminated = bool(
+                dropped
+                or grasp_success
+                or (self.curriculum_stage in {"A", "B"} and stage_distance_success)
+                or stage_contact_success
+            )
             truncated = bool(not terminated and self._step_count >= self.max_steps)
             if truncated:
-                reward -= 10.0
+                reward -= config.timeout_penalty
             info = {
                 "distance_m": distance,
                 "distance_progress_m": distance_progress,
@@ -861,6 +1004,10 @@ else:
                 "ik_failed": ik_failed,
                 "joint_limit": joint_limit,
                 "step": self._step_count,
+                "curriculum_stage": self.curriculum_stage,
+                "target_handle": self.episode_target_handle,
+                "stage_distance_success": stage_distance_success,
+                "stage_contact_success": stage_contact_success,
             }
             return self._capture_observation(), float(reward), terminated, truncated, info
 

@@ -23,6 +23,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene-mode", default="physics", choices=("physics", "planned", "separated", "level4"))
     parser.add_argument("--planned-layout", default="auto")
     parser.add_argument(
+        "--stage",
+        choices=("auto", "A", "B", "C", "D", "E"),
+        default="auto",
+        help="train one fixed curriculum stage; auto uses the A->E curriculum callback",
+    )
+    parser.add_argument(
         "--execution-mode",
         default="settle_then_kinematic",
         choices=("kinematic", "settle_then_kinematic", "dynamic"),
@@ -54,6 +60,8 @@ def main() -> int:
             "CoppeliaSim environment currently supports one live simulator per training process; "
             "use --n-envs 1 or launch separate simulator instances."
         )
+    if args.stage != "auto":
+        args.curriculum = False
     try:
         from stable_baselines3 import PPO
         from stable_baselines3.common.callbacks import CheckpointCallback
@@ -74,6 +82,8 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     os.environ["ROBOT_GRASP_HEADLESS"] = "1"
 
+    fixed_stage = None if args.stage == "auto" else args.stage
+
     def make_env(rank: int):
         def _factory():
             env = EndToEndGraspEnv(
@@ -83,7 +93,7 @@ def main() -> int:
                 sim_steps_per_action=args.sim_steps_per_action,
                 seed=int(args.seed) + rank * 104729,
                 headless=True,
-                curriculum_stage="A" if args.curriculum else "E",
+                curriculum_stage=fixed_stage or ("A" if args.curriculum else "E"),
                 execution_mode=args.execution_mode,
             )
             return Monitor(env)
@@ -119,7 +129,7 @@ def main() -> int:
             return True
 
     callbacks = [checkpoint_callback]
-    if args.curriculum:
+    if args.curriculum and fixed_stage is None:
         callbacks.append(CurriculumCallback(args.timesteps))
     tensorboard_log = None
     if args.tensorboard:
@@ -161,6 +171,7 @@ def main() -> int:
         "execution_mode": args.execution_mode,
         "planned_layout": args.planned_layout,
         "curriculum": bool(args.curriculum),
+        "stage": args.stage,
         "seed": int(args.seed),
         "observation": "128x128 normalized depth + 7 joint positions + 7 joint velocities + gripper + previous action",
         "action": ["dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper"],

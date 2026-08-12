@@ -17,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=80)
     parser.add_argument("--scene-mode", default="physics")
     parser.add_argument("--planned-layout", default="auto")
+    parser.add_argument("--stage", choices=("A", "B", "C", "D", "E"), default="E")
     parser.add_argument(
         "--execution-mode",
         default="settle_then_kinematic",
@@ -48,6 +49,7 @@ def main() -> int:
             seed=int(args.seed) + episode * 7919,
             headless=False,
             execution_mode=args.execution_mode,
+            curriculum_stage=args.stage,
         )
         observation, info = env.reset(seed=int(args.seed) + episode * 7919)
         total_reward = 0.0
@@ -71,7 +73,12 @@ def main() -> int:
             }
         )
         print(json.dumps(results[-1], ensure_ascii=False, indent=2))
-    payload = {"checkpoint": str(args.checkpoint.resolve()), "episodes": results}
+    payload = {
+        "checkpoint": str(args.checkpoint.resolve()),
+        "stage": args.stage,
+        "execution_mode": args.execution_mode,
+        "episodes": results,
+    }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Saved evaluation: {args.output.resolve()}")
