@@ -63,6 +63,20 @@ def parse_args() -> argparse.Namespace:
         help="close RG2 and run lift verification after PBVS convergence",
     )
     parser.add_argument(
+        "--servo-dynamics",
+        action="store_true",
+        help=(
+            "use true synchronous iiwa dynamic control and dynamic RG2 opening/closing; "
+            "disables connector attachment"
+        ),
+    )
+    parser.add_argument(
+        "--servo-dynamics-mode",
+        choices=("position", "torque"),
+        default=os.environ.get("ROBOT_GRASP_DYNAMICS_MODE", "torque"),
+        help="dynamic actuator mode; position is the commissioning mode, torque is the impedance-like mode",
+    )
+    parser.add_argument(
         "--servo-target-id",
         type=int,
         help="prediction id to servo; otherwise the safest topmost object is selected",
@@ -133,6 +147,12 @@ def main() -> None:
         raise SystemExit("--servo-place-in-box requires --servo-execute-grasp")
     if args.servo_place_in_box and args.no_connector:
         raise SystemExit("--servo-place-in-box requires connector mode")
+    if args.servo_dynamics and args.no_connector is False:
+        # Dynamic mode never attaches a dummy.  Keep this explicit in the
+        # environment so a stale shell variable cannot re-enable connectors.
+        args.no_connector = True
+    if args.servo_dynamics and args.servo_place_in_box:
+        raise SystemExit("--servo-dynamics cannot be combined with --servo-place-in-box")
     if args.servo_lift_height_mm <= 0.0:
         raise SystemExit("--servo-lift-height-mm must be positive")
     environment = os.environ.copy()
@@ -156,6 +176,8 @@ def main() -> None:
         environment.pop("ROBOT_GRASP_HEADLESS", None)
     environment.pop("ROBOT_GRASP_ALLOW_GT_COUNT", None)
     environment["ROBOT_GRASP_USE_CONNECTOR"] = "0" if args.no_connector else "1"
+    environment["ROBOT_GRASP_DYNAMICS_CONTROL"] = "1" if args.servo_dynamics else "0"
+    environment["ROBOT_GRASP_DYNAMICS_MODE"] = str(args.servo_dynamics_mode)
     environment["ROBOT_GRASP_SERVO_GRASP_ORIENTATION"] = args.servo_grasp_orientation
     environment["ROBOT_GRASP_SERVO_TARGET_POLICY"] = args.servo_target_policy
     environment["ROBOT_GRASP_SERVO_LIFT_M"] = str(
@@ -204,6 +226,9 @@ def main() -> None:
             servo_arguments.extend(["--target-id", str(args.servo_target_id)])
         if args.servo_execute_grasp:
             servo_arguments.append("--execute-grasp")
+        if args.servo_dynamics:
+            servo_arguments.append("--dynamics")
+            servo_arguments.extend(["--dynamics-mode", str(args.servo_dynamics_mode)])
         if args.servo_place_in_box:
             servo_arguments.append("--place-in-box")
         servo_arguments.extend(

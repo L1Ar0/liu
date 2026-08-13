@@ -33,6 +33,7 @@ from visual_servo_perception import (
     track_state_from_prediction,
     update_track_state,
 )
+from joint_torque_controller import JointTorqueController, TorqueControllerConfig
 
 
 ROOT = Path(__file__).resolve().parent
@@ -227,6 +228,14 @@ USE_CONNECTOR = os.environ.get("ROBOT_GRASP_USE_CONNECTOR", "1").lower() not in 
 CONNECTOR_KINEMATIC_ONLY = os.environ.get(
     "ROBOT_GRASP_CONNECTOR_KINEMATIC_ONLY", "1"
 ).lower() not in {"0", "false", "no"}
+DYNAMICS_CONTROL = os.environ.get("ROBOT_GRASP_DYNAMICS_CONTROL", "0").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+DYNAMICS_MODE = os.environ.get("ROBOT_GRASP_DYNAMICS_MODE", "torque").strip().lower()
+if DYNAMICS_MODE not in {"torque", "position"}:
+    DYNAMICS_MODE = "torque"
 
 DROP_BOX_ALIAS_PREFIX = "grasp_drop_box_"
 DROP_BOX_INNER_X_M = float(os.environ.get("ROBOT_GRASP_DROP_BOX_INNER_X_M", "0.140"))
@@ -520,7 +529,16 @@ def _apply_initial_disturbance(
 class IncrementalIK:
     """Keep a damped simIK group alive while PBVS updates a target dummy."""
 
-    def __init__(self, sim: Any, sim_ik: Any, robot_base: int, tip: int) -> None:
+    def __init__(
+        self,
+        sim: Any,
+        sim_ik: Any,
+        robot_base: int,
+        tip: int,
+        client: RemoteAPIClient | None = None,
+        dynamics_control: bool = False,
+        dynamics_mode: str = DYNAMICS_MODE,
+    ) -> None:
         state = sim.getSimulationState()
         if state not in {sim.simulation_stopped, sim.simulation_paused}:
             raise RuntimeError(
@@ -528,6 +546,9 @@ class IncrementalIK:
             )
         self.sim = sim
         self.sim_ik = sim_ik
+        self.client = client
+        self.dynamics_control = bool(dynamics_control)
+        self.dynamics_mode = str(dynamics_mode).strip().lower()
         self.robot_base = int(robot_base)
         self.tip = int(tip)
         self.joints = get_kuka_joints_from_tip(sim, tip)
@@ -539,6 +560,8 @@ class IncrementalIK:
         self.environment = None
         self.group = None
         self.element = None
+        self.ik_joints: list[int] = []
+        self.torque_controller: JointTorqueController | None = None
         self.full_pose_constraint = False
         self._setup()
 
@@ -562,6 +585,7 @@ class IncrementalIK:
             constraints,
         )
         ik_joints = [get_ik_handle(mapping, joint) for joint in self.joints]
+        self.ik_joints = [int(joint) for joint in ik_joints]
         self.sim_ik.setGroupCalculation(
             self.environment,
             self.group,
@@ -607,16 +631,37 @@ class IncrementalIK:
     def current_pose(self) -> np.ndarray:
         return _matrix34_to_44(self.sim.getObjectMatrix(self.tip, self.robot_base))
 
+    def _ensure_torque_controller(self) -> JointTorqueController:
+        if not self.dynamics_control:
+            raise RuntimeError("Torque controller requested for a kinematic IK instance")
+        if self.client is None:
+            raise RuntimeError("Dynamic visual servo requires a RemoteAPIClient")
+        if self.torque_controller is None:
+            self.torque_controller = JointTorqueController(
+                self.client,
+                self.sim,
+                self.joints,
+                TorqueControllerConfig.from_environment(),
+                control_mode=self.dynamics_mode,
+            )
+            self.torque_controller.start()
+        return self.torque_controller
+
     def apply(self, target_pose: np.ndarray) -> np.ndarray:
         self.sim.setObjectPose(
             self.target,
             pose_from_matrix(target_pose),
             self.robot_base,
         )
+        if self.dynamics_control:
+            # The IK world is only a reference model.  Refresh it from the
+            # measured dynamic arm before every solve so q_des is generated
+            # from actual q, never from the previous kinematic solution.
+            self.sim_ik.syncFromSim(self.environment, [self.group])
         result, flags, precision = self.sim_ik.handleGroup(
             self.environment,
             self.group,
-            {"syncWorlds": True},
+            {"syncWorlds": not self.dynamics_control},
         )
         if result != self.sim_ik.result_success:
             position_precision = float(precision[0]) if len(precision) else float("inf")
@@ -627,6 +672,14 @@ class IncrementalIK:
                     f"flags={flags}, position={position_precision * 1000:.2f} mm, "
                     f"orientation={math.degrees(orientation_precision):.2f} deg"
                 )
+        if self.dynamics_control:
+            controller = self._ensure_torque_controller()
+            desired_q = [
+                float(self.sim_ik.getJointPosition(self.environment, joint))
+                for joint in self.ik_joints
+            ]
+            controller.step(desired_q)
+            return self.current_pose()
         return self.current_pose()
 
     def move_linear(
@@ -672,6 +725,12 @@ class IncrementalIK:
         return last
 
     def close(self) -> None:
+        if self.torque_controller is not None:
+            try:
+                self.torque_controller.close()
+            except Exception:
+                pass
+            self.torque_controller = None
         if self.environment is not None:
             try:
                 self.sim_ik.eraseEnvironment(self.environment)
@@ -937,6 +996,11 @@ def _run_gripper_motion(
     def hold_robot_joints() -> None:
         if held_joint_positions is None or hold_ik is None:
             return
+        if hold_ik.dynamics_control and hold_ik.torque_controller is not None:
+            # Never overwrite a dynamic arm with setJointPosition.  Refresh
+            # the seven torque commands before each synchronous physics step.
+            hold_ik.torque_controller.apply_torque()
+            return
         for joint, position in zip(hold_ik.joints, held_joint_positions):
             try:
                 sim.setJointPosition(joint, position)
@@ -979,7 +1043,53 @@ def _run_gripper_motion(
     return before, after
 
 
-def _prepare_physics_grasp(sim: Any, robot_base: int) -> int:
+def _run_dynamic_rg2_motion(
+    client: RemoteAPIClient,
+    sim: Any,
+    value: int,
+    steps: int = GRIPPER_STEPS,
+    arm_controller: JointTorqueController | None = None,
+) -> tuple[float | None, float | None]:
+    """Run the stock RG2 child script in true dynamics and verify its motor."""
+    drive_joint = _find_gripper_drive_joint(sim)
+    before = None
+    if drive_joint is not None:
+        before = float(sim.getJointPosition(drive_joint))
+    _set_gripper_signal(sim, value)
+    client.setStepping(True)
+    state = sim.getSimulationState()
+    if state in {sim.simulation_stopped, sim.simulation_paused}:
+        sim.startSimulation()
+    for _ in range(max(1, int(steps))):
+        if arm_controller is not None:
+            if arm_controller.control_mode == "position":
+                arm_controller.apply_position_target()
+            else:
+                arm_controller.apply_torque()
+        client.step()
+    after = None
+    if drive_joint is not None:
+        after = float(sim.getJointPosition(drive_joint))
+    if before is not None and after is not None:
+        print(
+            "RG2 dynamic openCloseJoint: "
+            f"{before:.6f} -> {after:.6f} "
+            f"(motion={abs(after - before):.6f})"
+        )
+        if abs(after - before) < GRIPPER_JOINT_MOVE_EPS:
+            raise RuntimeError(
+                "RG2 dynamic command produced no openCloseJoint motion; "
+                "check RG2_open signal, dynamic mode, and child script"
+            )
+    return before, after
+
+
+def _prepare_physics_grasp(
+    sim: Any,
+    robot_base: int,
+    target_state: TargetTrackState | None = None,
+    force_dynamic: bool = False,
+) -> int:
     """Restore dynamic/respondable state for generated physics objects.
 
     The scene remains paused during visual servoing, but a body must stay
@@ -988,7 +1098,8 @@ def _prepare_physics_grasp(sim: Any, robot_base: int) -> int:
     which is useful when a scene was interrupted during generation.
     """
 
-    if os.environ.get("ROBOT_GRASP_SCENE_MODE", "").lower() not in {
+    scene_mode = os.environ.get("ROBOT_GRASP_SCENE_MODE", "").lower()
+    if not force_dynamic and scene_mode not in {
         "physics",
         "dynamic",
         "settled",
@@ -1000,12 +1111,24 @@ def _prepare_physics_grasp(sim: Any, robot_base: int) -> int:
     mask_param = getattr(sim, "shapeintparam_respondable_mask", None)
     changed = 0
     shapes = sim.getObjectsInTree(sim.handle_scene, sim.sceneobject_shape, 0)
+    target_handle = None
+    if target_state is not None:
+        try:
+            target_handle, _ = _resolve_target_shape(sim, robot_base, target_state)
+        except Exception:
+            target_handle = None
+    dynamic_all = scene_mode in {"physics", "dynamic", "settled", "drop"}
+    dynamic_all = dynamic_all or os.environ.get(
+        "ROBOT_GRASP_DYNAMIC_ALL_WORKPIECES", "0"
+    ).lower() not in {"0", "false", "no"}
     for handle in shapes:
         try:
             alias = str(sim.getObjectAlias(handle)).lower()
         except Exception:
             continue
         if not alias.startswith("rand_"):
+            continue
+        if not dynamic_all and target_handle is not None and int(handle) != int(target_handle):
             continue
         if static_param is not None:
             try:
@@ -1040,6 +1163,26 @@ def _prepare_physics_grasp(sim: Any, robot_base: int) -> int:
             except Exception:
                 pass
     return changed
+
+
+def _assert_dynamic_target(sim: Any, robot_base: int, target_state: TargetTrackState) -> dict[str, Any]:
+    """Fail loudly instead of silently running a pseudo-physical grasp."""
+    handle, alias = _resolve_target_shape(sim, robot_base, target_state)
+    static_param = getattr(sim, "shapeintparam_static", None)
+    respondable_param = getattr(sim, "shapeintparam_respondable", None)
+    static = None if static_param is None else int(sim.getObjectInt32Param(handle, static_param))
+    respondable = None if respondable_param is None else int(sim.getObjectInt32Param(handle, respondable_param))
+    if static == 1 or respondable == 0:
+        raise RuntimeError(
+            f"Physical grasp target {alias} is not dynamic/respondable "
+            f"(static={static}, respondable={respondable})"
+        )
+    dynamic = False
+    try:
+        dynamic = bool(sim.isDynamicallyEnabled(handle))
+    except Exception:
+        pass
+    return {"target_handle": int(handle), "target_alias": alias, "static": static, "respondable": respondable, "dynamically_enabled": dynamic}
 
 
 def _resolve_target_shape(
@@ -1390,11 +1533,13 @@ def run_visual_servo(
     initial_euler_deg: np.ndarray | None = None,
     open_loop_only: bool = False,
     align_only: bool = False,
+    dynamics_control: bool = DYNAMICS_CONTROL,
+    dynamics_mode: str = DYNAMICS_MODE,
 ) -> dict[str, Any]:
     if place_in_box and not execute_grasp:
         raise RuntimeError("Drop-box placement requires grasp execution")
-    if place_in_box and not USE_CONNECTOR:
-        raise RuntimeError("Drop-box placement requires the deterministic connector")
+    if place_in_box and (not USE_CONNECTOR or dynamics_control):
+        raise RuntimeError("Drop-box placement is only available in connector mode")
     recognition = _load_json(RECOGNITION_FILE)
     segmentation = _load_json(SEGMENTATION_FILE)
     target_prediction = select_servo_target(
@@ -1428,7 +1573,17 @@ def run_visual_servo(
         f"confidence={state.confidence:.2f}"
     )
 
-    ik = IncrementalIK(sim, sim_ik, robot_base, tip)
+    if dynamics_control and open_loop_only:
+        raise RuntimeError("Dynamic control requires the closed-loop stepping path")
+    ik = IncrementalIK(
+        sim,
+        sim_ik,
+        robot_base,
+        tip,
+        client=client,
+        dynamics_control=bool(dynamics_control),
+        dynamics_mode=dynamics_mode,
+    )
     trace: list[dict[str, Any]] = []
     converged = False
     lost_count = 0
@@ -1463,18 +1618,24 @@ def run_visual_servo(
             table_plane,
             duration_s=SERVO_PREGRASP_DURATION_S,
         )
-        if execute_grasp and not (USE_CONNECTOR and CONNECTOR_KINEMATIC_ONLY):
+        if execute_grasp and (dynamics_control or not (USE_CONNECTOR and CONNECTOR_KINEMATIC_ONLY)):
             # Active second-view motion may leave the TCP only a few millimetres
             # above the clearance gate. First retreat to the high pregrasp,
             # then open RG2 so finger motion cannot invalidate the safe path.
             print("Opening RG2 gripper at the safe pregrasp pose...")
-            _run_gripper_motion(
-                client,
-                sim,
-                GRIPPER_OPEN_VALUE,
-                hold_ik=ik,
-                hold_pose=current.copy(),
-            )
+            if dynamics_control:
+                _run_dynamic_rg2_motion(
+                    client, sim, GRIPPER_OPEN_VALUE,
+                    arm_controller=ik.torque_controller,
+                )
+            else:
+                _run_gripper_motion(
+                    client,
+                    sim,
+                    GRIPPER_OPEN_VALUE,
+                    hold_ik=ik,
+                    hold_pose=current.copy(),
+                )
             current = ik.current_pose()
         elif execute_grasp:
             print(
@@ -1843,11 +2004,23 @@ def run_visual_servo(
                 f"right_gap={jaw_centering['right_clearance_mm']:.1f} mm"
             )
             _validate_grasp_observation(state, last_observation)
-            restored = _prepare_physics_grasp(sim, robot_base)
+            restored = _prepare_physics_grasp(
+                sim,
+                robot_base,
+                target_state=state,
+                force_dynamic=bool(dynamics_control),
+            )
             if restored:
                 print(f"Physics grasp preparation: {restored} generated bodies dynamic/respondable")
+            if dynamics_control:
+                target_dynamics = _assert_dynamic_target(sim, robot_base, state)
+                print(
+                    "Physical target validated: "
+                    f"{target_dynamics['target_alias']} "
+                    f"dynamic={target_dynamics['dynamically_enabled']}"
+                )
             print("Closing RG2 gripper...")
-            if USE_CONNECTOR and CONNECTOR_KINEMATIC_ONLY:
+            if USE_CONNECTOR and CONNECTOR_KINEMATIC_ONLY and not dynamics_control:
                 # Keep the arm and camera at the converged pose.  The connector
                 # below is the explicit closed-gripper action and is what makes
                 # the subsequent lift deterministic in a paused scene.
@@ -1858,13 +2031,21 @@ def run_visual_servo(
                 )
             else:
                 close_hold_pose = ik.current_pose()
-                before_close, after_close = _run_gripper_motion(
-                    client,
-                    sim,
-                    GRIPPER_CLOSE_VALUE,
-                    hold_ik=ik,
-                    hold_pose=close_hold_pose,
-                )
+                if dynamics_control:
+                    before_close, after_close = _run_dynamic_rg2_motion(
+                        client,
+                        sim,
+                        GRIPPER_CLOSE_VALUE,
+                        arm_controller=ik.torque_controller,
+                    )
+                else:
+                    before_close, after_close = _run_gripper_motion(
+                        client,
+                        sim,
+                        GRIPPER_CLOSE_VALUE,
+                        hold_ik=ik,
+                        hold_pose=close_hold_pose,
+                    )
                 if before_close is not None and after_close is not None:
                     gripper_close_motion = abs(after_close - before_close)
                     if gripper_close_motion < GRIPPER_JOINT_MOVE_EPS:
@@ -1872,7 +2053,7 @@ def run_visual_servo(
                             "RG2 close command produced no openCloseJoint motion; "
                             "check the RG2_open child-script signal and joint mode"
                         )
-            if USE_CONNECTOR:
+            if USE_CONNECTOR and not dynamics_control:
                 connector_attachment = _attach_connector(
                     sim,
                     robot_base,
@@ -1890,7 +2071,7 @@ def run_visual_servo(
                 state,
                 table_plane,
                 SERVO_LIFT_M,
-                kinematic_only=bool(USE_CONNECTOR and CONNECTOR_KINEMATIC_ONLY),
+                kinematic_only=bool(USE_CONNECTOR and CONNECTOR_KINEMATIC_ONLY and not dynamics_control),
             )
             print(f"Grasp lift verification: {'PASS' if grasp_verified else 'NOT_CONFIRMED'}")
             if not grasp_verified:
@@ -1927,12 +2108,19 @@ def run_visual_servo(
             "final_position_error_mm": None if final_error is None else final_error.position_norm_m * 1000.0,
             "final_rotation_error_deg": None if final_error is None else math.degrees(final_error.rotation_norm_rad),
             "uses_color_features": False,
-            "controller": "rgbd_pbvs_incremental_ik",
+            "controller": (
+                "rgbd_pbvs_incremental_ik_dynamic_torque"
+                if dynamics_control and dynamics_mode == "torque"
+                else "rgbd_pbvs_incremental_ik_dynamic_position"
+                if dynamics_control
+                else "rgbd_pbvs_incremental_ik"
+            ),
             "grasp_orientation": str(grasp_orientation),
             "target_policy": str(target_policy),
             "selection_seed": selection_seed,
             "max_commanded_tilt_deg": GRASP_MAX_TILT_DEG,
             "control_mode": "closed_loop",
+            "dynamics_control": bool(dynamics_control),
             "initial_translation_mm": None
             if initial_translation_m is None
             else (np.asarray(initial_translation_m) * 1000.0).tolist(),
@@ -1952,11 +2140,18 @@ def run_visual_servo(
             "placement": placement_result,
             "jaw_centering": jaw_centering,
             "uses_color_features": False,
-            "controller": "rgbd_pbvs_incremental_ik",
+            "controller": (
+                "rgbd_pbvs_incremental_ik_dynamic_torque"
+                if dynamics_control and dynamics_mode == "torque"
+                else "rgbd_pbvs_incremental_ik_dynamic_position"
+                if dynamics_control
+                else "rgbd_pbvs_incremental_ik"
+            ),
             "grasp_orientation": str(grasp_orientation),
             "target_policy": str(target_policy),
             "selection_seed": selection_seed,
             "control_mode": "closed_loop",
+            "dynamics_control": bool(dynamics_control),
             "error": str(exc),
         }
         _write_outputs(summary, trace)
@@ -1974,6 +2169,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Geometry-only RGB-D visual servo")
     parser.add_argument("--target-id", type=int)
     parser.add_argument("--execute-grasp", action="store_true")
+    parser.add_argument(
+        "--dynamics",
+        action="store_true",
+        default=DYNAMICS_CONTROL,
+        help=(
+            "use dynamic iiwa joints with synchronous joint-space torque control; "
+            "connector attachment is disabled automatically"
+        ),
+    )
+    parser.add_argument(
+        "--dynamics-mode",
+        choices=("position", "torque"),
+        default=DYNAMICS_MODE,
+        help="dynamic joint actuator mode; position is the safer commissioning milestone",
+    )
     parser.add_argument("--max-iterations", type=int, default=SERVO_MAX_ITERATIONS)
     parser.add_argument(
         "--target-policy",
@@ -2030,6 +2240,8 @@ def main() -> None:
         else np.asarray(args.initial_euler_deg, dtype=np.float64),
         open_loop_only=bool(args.open_loop),
         align_only=bool(args.align_only),
+        dynamics_control=bool(args.dynamics),
+        dynamics_mode=str(args.dynamics_mode),
     )
 
 
