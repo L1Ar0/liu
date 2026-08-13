@@ -233,7 +233,7 @@ DYNAMICS_CONTROL = os.environ.get("ROBOT_GRASP_DYNAMICS_CONTROL", "0").lower() n
     "false",
     "no",
 }
-DYNAMICS_MODE = os.environ.get("ROBOT_GRASP_DYNAMICS_MODE", "torque").strip().lower()
+DYNAMICS_MODE = os.environ.get("ROBOT_GRASP_DYNAMICS_MODE", "position").strip().lower()
 if DYNAMICS_MODE not in {"torque", "position"}:
     DYNAMICS_MODE = "torque"
 
@@ -1061,7 +1061,15 @@ def _run_dynamic_rg2_motion(
     arm_controller: JointTorqueController | None = None,
     require_motion: bool = True,
 ) -> tuple[float | None, float | None]:
-    """Run the stock RG2 child script in true dynamics and verify its motor."""
+    """Run the stock RG2 child script and verify its motor.
+
+    The RG2 child script is the single actuator authority.  Earlier versions
+    also rewrote ``openCloseJoint`` mode, force and target velocity here,
+    which made Python and the child script race each other.  That is
+    especially harmful when the gripper is attached through a force sensor.
+    Python now publishes only the command signal and keeps the arm controller
+    alive while the stock RG2 script drives the gripper joints.
+    """
     drive_joint = _find_gripper_drive_joint(sim)
     before = None
     if drive_joint is not None:
@@ -1071,20 +1079,6 @@ def _run_dynamic_rg2_motion(
     state = sim.getSimulationState()
     if state in {sim.simulation_stopped, sim.simulation_paused}:
         sim.startSimulation()
-    # RG2's driver joint is a dynamic velocity-controlled joint.  The child
-    # script normally writes this command, but external stepping can encounter
-    # a paused/disabled child script.  Set the same low-level command here so
-    # the gripper remains deterministic while retaining its dynamic contacts.
-    drive_mode = getattr(sim, "jointmode_dynamic", 5)
-    velocity_mode = getattr(sim, "jointdynctrl_velocity", 4)
-    if drive_joint is not None:
-        try:
-            sim.setJointMode(drive_joint, drive_mode)
-            sim.setObjectInt32Param(drive_joint, sim.jointintparam_dynctrlmode, velocity_mode)
-            sim.setJointTargetForce(drive_joint, 20.0)
-            sim.setJointTargetVelocity(drive_joint, 0.05 if int(value) != 0 else -0.05)
-        except Exception:
-            pass
     for _ in range(max(1, int(steps))):
         if arm_controller is not None:
             if arm_controller.control_mode == "position":
@@ -1108,11 +1102,6 @@ def _run_dynamic_rg2_motion(
                 "RG2 dynamic command produced no openCloseJoint motion; "
                 "check RG2_open signal, dynamic mode, and child script"
             )
-    if drive_joint is not None:
-        try:
-            sim.setJointTargetVelocity(drive_joint, 0.0)
-        except Exception:
-            pass
     return before, after
 
 
@@ -1403,7 +1392,6 @@ def _lift_and_verify(
                 + smooth_ratio * lifted[:3, 3]
             )
             ik.apply(pose)
-            client.step()
             if lift_duration > 0.0:
                 time.sleep(lift_duration / lift_steps)
         sim.pauseSimulation()

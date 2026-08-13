@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--servo-dynamics-mode",
         choices=("position", "torque"),
-        default=os.environ.get("ROBOT_GRASP_DYNAMICS_MODE", "torque"),
+        default=os.environ.get("ROBOT_GRASP_DYNAMICS_MODE", "position"),
         help="dynamic actuator mode; position is the commissioning mode, torque is the impedance-like mode",
     )
     parser.add_argument(

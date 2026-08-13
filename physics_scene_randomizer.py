@@ -116,25 +116,88 @@ def _restore_robot_collisions(sim: Any, saved: list[tuple[int, int]]) -> None:
 
 def _capture_robot_configuration(sim: Any, robot_base: int) -> dict[str, Any]:
     joints: list[tuple[int, float]] = []
+    joint_modes: list[tuple[int, int]] = []
+    joint_dynctrl_modes: list[tuple[int, int | None]] = []
+    mode_param = getattr(sim, "jointintparam_mode", None)
+    dynctrl_param = getattr(sim, "jointintparam_dynctrlmode", None)
     for handle in sim.getObjectsInTree(robot_base, sim.sceneobject_joint, 0):
+        handle = int(handle)
         try:
-            joints.append((int(handle), float(sim.getJointPosition(handle))))
+            joints.append((handle, float(sim.getJointPosition(handle))))
         except Exception:
             continue
-    object_poses: list[tuple[int, list[float]]] = []
-    for handle in sim.getObjectsInTree(robot_base, sim.handle_all, 0):
-        if int(handle) == int(robot_base):
-            continue
         try:
-            pose = [float(value) for value in sim.getObjectPose(handle, robot_base)]
-            object_poses.append((int(handle), pose))
+            raw_mode = sim.getJointMode(handle)
+            mode = int(raw_mode[0] if isinstance(raw_mode, (tuple, list)) else raw_mode)
+            if mode_param is not None:
+                try:
+                    mode = int(sim.getObjectInt32Param(handle, mode_param))
+                except Exception:
+                    pass
+            joint_modes.append((handle, mode))
         except Exception:
-            continue
+            pass
+        dynctrl: int | None = None
+        if dynctrl_param is not None:
+            try:
+                dynctrl = int(sim.getObjectInt32Param(handle, dynctrl_param))
+            except Exception:
+                pass
+        joint_dynctrl_modes.append((handle, dynctrl))
     return {
         "base_pose_world": [float(value) for value in sim.getObjectPose(robot_base, -1)],
         "joints": joints,
-        "object_poses_base": object_poses,
+        "joint_modes": joint_modes,
+        "joint_dynctrl_modes": joint_dynctrl_modes,
     }
+
+
+def _set_robot_kinematic_for_settle(sim: Any, configuration: dict[str, Any]) -> None:
+    """Hold the arm while generated workpieces settle.
+
+    Scene generation is not a control experiment.  The arm must therefore be
+    temporarily kinematic; otherwise gravity acts on the dynamic iiwa chain
+    before the visual-servo controller has been created and the model can fall
+    apart.  Only the seven joint states/modes are changed here.  Descendant
+    poses are intentionally never overwritten.
+    """
+    kinematic_mode = int(getattr(sim, "jointmode_kinematic", 0))
+    dynctrl_param = getattr(sim, "jointintparam_dynctrlmode", None)
+    position_mode = int(getattr(sim, "jointdynctrl_position", 8))
+    for handle, position in configuration.get("joints", []):
+        try:
+            sim.setJointMode(int(handle), kinematic_mode)
+            sim.setJointPosition(int(handle), float(position))
+            if dynctrl_param is not None:
+                try:
+                    sim.setObjectInt32Param(int(handle), dynctrl_param, position_mode)
+                except Exception:
+                    pass
+        except Exception:
+            continue
+
+
+def _restore_joint_configuration(sim: Any, configuration: dict[str, Any]) -> None:
+    """Restore q and joint actuator modes, without restoring link poses."""
+    for handle, position in configuration.get("joints", []):
+        try:
+            sim.setJointPosition(int(handle), float(position))
+        except Exception:
+            pass
+    for handle, mode in configuration.get("joint_modes", []):
+        try:
+            sim.setJointMode(int(handle), int(mode))
+        except Exception:
+            pass
+    dynctrl_param = getattr(sim, "jointintparam_dynctrlmode", None)
+    if dynctrl_param is not None:
+        for handle, dynctrl in configuration.get("joint_dynctrl_modes", []):
+            if dynctrl is None:
+                continue
+            try:
+                sim.setObjectInt32Param(int(handle), dynctrl_param, int(dynctrl))
+            except Exception:
+                pass
 
 
 def _restore_robot_configuration(
@@ -142,17 +205,14 @@ def _restore_robot_configuration(
     robot_base: int,
     configuration: dict[str, Any],
 ) -> None:
-    sim.setObjectPose(robot_base, configuration["base_pose_world"], -1)
-    for handle, position in configuration["joints"]:
-        try:
-            sim.setJointPosition(handle, position)
-        except Exception:
-            pass
-    for handle, pose in configuration["object_poses_base"]:
-        try:
-            sim.setObjectPose(handle, pose, robot_base)
-        except Exception:
-            pass
+    # The base and joint coordinates are enough.  Restoring every descendant
+    # pose fights the joint/force-sensor constraints and can break a dynamic
+    # chain such as link8_resp -> connection -> RG2.
+    try:
+        sim.setObjectPose(robot_base, configuration["base_pose_world"], -1)
+    except Exception:
+        pass
+    _restore_joint_configuration(sim, configuration)
 
 
 def _set_engine_float(sim: Any, handle: int, parameter_name: str, value: float) -> None:
@@ -503,6 +563,10 @@ def generate_physics_scene(
     robot_configuration = _capture_robot_configuration(sim, robot_base)
     counters = {name: 0 for name in classes}
     try:
+        # Workpiece settling must not be allowed to pull the uncommanded iiwa
+        # through gravity.  The real dynamic controller is installed later by
+        # visual_servo_runner, after perception has finished.
+        _set_robot_kinematic_for_settle(sim, robot_configuration)
         robot_collision_state = _suspend_robot_collisions(sim, robot_base)
         wall_handles = _make_containment_walls(sim, robot_base, reference)
         for index, class_name in enumerate(classes):
