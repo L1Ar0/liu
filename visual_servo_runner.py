@@ -953,7 +953,17 @@ def _set_gripper_signal(sim: Any, value: int) -> None:
         sim.clearFloatSignal(GRIPPER_SIGNAL_NAME)
     except Exception:
         pass
-    sim.setInt32Signal(GRIPPER_SIGNAL_NAME, int(value))
+    value = int(value)
+    # Current RG2 models read the namespaced property signal.  Keep the old
+    # signal as a compatibility fallback for older scenes.
+    try:
+        sim.setIntProperty(sim.handle_scene, f"signal.{GRIPPER_SIGNAL_NAME}", value)
+    except Exception:
+        pass
+    try:
+        sim.setInt32Signal(GRIPPER_SIGNAL_NAME, value)
+    except Exception:
+        pass
 
 
 def _find_gripper_drive_joint(sim: Any) -> int | None:
@@ -1049,6 +1059,7 @@ def _run_dynamic_rg2_motion(
     value: int,
     steps: int = GRIPPER_STEPS,
     arm_controller: JointTorqueController | None = None,
+    require_motion: bool = True,
 ) -> tuple[float | None, float | None]:
     """Run the stock RG2 child script in true dynamics and verify its motor."""
     drive_joint = _find_gripper_drive_joint(sim)
@@ -1060,6 +1071,20 @@ def _run_dynamic_rg2_motion(
     state = sim.getSimulationState()
     if state in {sim.simulation_stopped, sim.simulation_paused}:
         sim.startSimulation()
+    # RG2's driver joint is a dynamic velocity-controlled joint.  The child
+    # script normally writes this command, but external stepping can encounter
+    # a paused/disabled child script.  Set the same low-level command here so
+    # the gripper remains deterministic while retaining its dynamic contacts.
+    drive_mode = getattr(sim, "jointmode_dynamic", 5)
+    velocity_mode = getattr(sim, "jointdynctrl_velocity", 4)
+    if drive_joint is not None:
+        try:
+            sim.setJointMode(drive_joint, drive_mode)
+            sim.setObjectInt32Param(drive_joint, sim.jointintparam_dynctrlmode, velocity_mode)
+            sim.setJointTargetForce(drive_joint, 20.0)
+            sim.setJointTargetVelocity(drive_joint, 0.05 if int(value) != 0 else -0.05)
+        except Exception:
+            pass
     for _ in range(max(1, int(steps))):
         if arm_controller is not None:
             if arm_controller.control_mode == "position":
@@ -1076,11 +1101,18 @@ def _run_dynamic_rg2_motion(
             f"{before:.6f} -> {after:.6f} "
             f"(motion={abs(after - before):.6f})"
         )
-        if abs(after - before) < GRIPPER_JOINT_MOVE_EPS:
+        # Opening from an already-open hard stop legitimately produces zero
+        # motion.  Closing must move because it is the grasp action.
+        if require_motion and abs(after - before) < GRIPPER_JOINT_MOVE_EPS:
             raise RuntimeError(
                 "RG2 dynamic command produced no openCloseJoint motion; "
                 "check RG2_open signal, dynamic mode, and child script"
             )
+    if drive_joint is not None:
+        try:
+            sim.setJointTargetVelocity(drive_joint, 0.0)
+        except Exception:
+            pass
     return before, after
 
 
@@ -1627,6 +1659,7 @@ def run_visual_servo(
                 _run_dynamic_rg2_motion(
                     client, sim, GRIPPER_OPEN_VALUE,
                     arm_controller=ik.torque_controller,
+                    require_motion=False,
                 )
             else:
                 _run_gripper_motion(

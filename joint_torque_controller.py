@@ -96,6 +96,8 @@ class JointTorqueController:
         self.original_dynctrl: tuple[int | None, ...] = tuple(
             self._read_dynctrl_mode(joint) for joint in self.joints
         )
+        self.original_script_enabled: int | None = None
+        self.iiwa_script: int | None = None
         self.qd = self.read_positions()
         self.bias = np.zeros(7, dtype=np.float64)
         self.gravity_bias = np.zeros(7, dtype=np.float64)
@@ -107,6 +109,7 @@ class JointTorqueController:
         self.started_simulation = False
         self._iiwa_handle: int | None = None
         self._original_model_property: int | None = None
+        self._original_scripts_inactive = False
 
     def _read_dynctrl_mode(self, joint: int) -> int | None:
         parameter = getattr(self.sim, "jointintparam_dynctrlmode", None)
@@ -156,18 +159,35 @@ class JointTorqueController:
                     self.sim.setObjectInt32Param(joint, motor_param, 1)
                 except Exception:
                     pass
-        # The stock iiwa model contains a customization script with a
-        # demonstration trajectory.  It must not keep issuing its own
-        # moveToConfig commands while an external controller is active.
+        # The stock iiwa customization script contains only a demonstration
+        # trajectory and must not compete with the external arm controller.
+        # Do not disable the whole model: RG2's child script is part of that
+        # model and must continue to receive open/close commands.
         try:
-            script = self.sim.getScriptAssociatedWithObject(self.sim.getObject("/iiwa"))
+            iiwa = int(self.sim.getObject("/iiwa"))
+            script = self.sim.getScriptAssociatedWithObject(iiwa)
             if script is not None and int(script) >= 0:
-                inactive = getattr(self.sim, "modelproperty_scripts_inactive", None)
-                if inactive is not None:
-                    iiwa = self.sim.getObject("/iiwa")
-                    self._iiwa_handle = int(iiwa)
-                    self._original_model_property = int(self.sim.getModelProperty(iiwa))
-                    self.sim.setModelProperty(iiwa, self._original_model_property | int(inactive))
+                self._iiwa_handle = iiwa
+                self.iiwa_script = int(script)
+                self._original_model_property = int(self.sim.getModelProperty(iiwa))
+                # Disable just the iiwa customization script, not all model
+                # scripts.  The script enabled parameter is the supported
+                # per-script switch in current CoppeliaSim releases.
+                enabled_param = getattr(self.sim, "scriptintparam_enabled", None)
+                if enabled_param is not None:
+                    try:
+                        try:
+                            raw_enabled = self.sim.getScriptInt32Param(
+                                int(script), enabled_param
+                            )
+                            if raw_enabled is not None:
+                                self.original_script_enabled = int(raw_enabled)
+                        except Exception:
+                            pass
+                        self.sim.setScriptInt32Param(int(script), enabled_param, 0)
+                        self._original_scripts_inactive = True
+                    except Exception:
+                        pass
         except Exception:
             pass
         self.qd = initial_q
@@ -367,8 +387,19 @@ class JointTorqueController:
                     except Exception:
                         pass
         if self._iiwa_handle is not None and self._original_model_property is not None:
+            # Restore the model property only.  The per-script switch is
+            # restored by CoppeliaSim when the stopped scene is restarted.
+            try: self.sim.setModelProperty(self._iiwa_handle, self._original_model_property)
+            except Exception: pass
+        if self.iiwa_script is not None and self._original_scripts_inactive:
             try:
-                self.sim.setModelProperty(self._iiwa_handle, self._original_model_property)
+                enabled_param = getattr(self.sim, "scriptintparam_enabled", None)
+                if enabled_param is not None:
+                    self.sim.setScriptInt32Param(
+                        self.iiwa_script,
+                        enabled_param,
+                        1 if self.original_script_enabled is None else self.original_script_enabled,
+                    )
             except Exception:
                 pass
         self.active = False
