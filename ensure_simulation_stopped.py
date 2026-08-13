@@ -12,6 +12,10 @@ def is_grasp_connector_alias(alias: str) -> bool:
     return normalized.startswith("grasp_connector_rand_")
 
 
+def is_grasp_drop_box_alias(alias: str) -> bool:
+    return str(alias).strip().lower().startswith("grasp_drop_box_")
+
+
 def remove_stale_grasp_connectors(sim: object) -> int:
     """Detach carried shapes and remove connector dummies from earlier runs."""
 
@@ -40,6 +44,26 @@ def remove_stale_grasp_connectors(sim: object) -> int:
     return removed
 
 
+def remove_stale_drop_boxes(sim: object) -> int:
+    """Remove the previous run's external placement box before regeneration."""
+
+    removed = 0
+    shapes = sim.getObjectsInTree(sim.handle_scene, sim.sceneobject_shape, 0)
+    for handle in shapes:
+        try:
+            alias = str(sim.getObjectAlias(handle))
+        except Exception:
+            continue
+        if not is_grasp_drop_box_alias(alias):
+            continue
+        try:
+            sim.removeObject(handle)
+            removed += 1
+        except Exception:
+            pass
+    return removed
+
+
 def main() -> None:
     client = RemoteAPIClient()
     sim = client.require("sim")
@@ -56,6 +80,9 @@ def main() -> None:
     removed = remove_stale_grasp_connectors(sim)
     if removed:
         print(f"Removed stale grasp connectors: {removed}")
+    removed_boxes = remove_stale_drop_boxes(sim)
+    if removed_boxes:
+        print(f"Removed stale drop-box pieces: {removed_boxes}")
 
 
 if __name__ == "__main__":

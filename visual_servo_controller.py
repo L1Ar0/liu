@@ -68,6 +68,7 @@ def _rotation_distance(first: np.ndarray, second: np.ndarray) -> float:
 def _choose_grasp_rotation(
     class_name: str,
     object_rotation: np.ndarray,
+    dimensions_m: np.ndarray,
     current_tip_rotation: np.ndarray,
     table_normal: np.ndarray,
 ) -> np.ndarray:
@@ -77,7 +78,22 @@ def _choose_grasp_rotation(
     if class_name in {"sphere", "cylinder", "cone"}:
         return _top_down_frame(current_x, table_normal)
 
-    base_x = np.asarray(object_rotation, dtype=np.float64)[:, 0]
+    rotation = np.asarray(object_rotation, dtype=np.float64)
+    dimensions = np.asarray(dimensions_m, dtype=np.float64)
+    normal = normalize(table_normal)
+    horizontal_axes = [
+        index
+        for index in range(3)
+        if abs(float(np.dot(rotation[:, index], normal))) <= 0.70
+    ]
+    if class_name == "cuboid" and horizontal_axes:
+        # RG2 closes along the grasp-frame X axis.  Align it with the shorter
+        # observable box side so a 70x35x30 mm cuboid is not approached across
+        # its 70 mm length.
+        closing_axis = min(horizontal_axes, key=lambda index: dimensions[index])
+        base_x = rotation[:, closing_axis]
+    else:
+        base_x = rotation[:, 0]
     steps = SYMMETRY_STEPS.get(class_name, 1)
     candidates: list[np.ndarray] = []
     for index in range(steps):
@@ -123,6 +139,7 @@ def build_top_down_grasp_pose(
     result[:3, :3] = _choose_grasp_rotation(
         class_name,
         object_rotation,
+        dimensions_m,
         current_tip_rotation,
         normal,
     )
@@ -182,7 +199,21 @@ def build_surface_aligned_grasp_pose(
             approach = normalize((1.0 - blend) * table + blend * approach)
 
     z_axis = -approach
-    x_hint = rotation[:, int(np.argmax(np.asarray(dimensions_m, dtype=np.float64)))]
+    dimensions = np.asarray(dimensions_m, dtype=np.float64)
+    if class_name == "cuboid":
+        side_axes = [
+            index
+            for index in range(3)
+            if abs(float(np.dot(rotation[:, index], approach))) <= 0.70
+        ]
+        x_index = (
+            min(side_axes, key=lambda index: dimensions[index])
+            if side_axes
+            else int(np.argmin(dimensions))
+        )
+    else:
+        x_index = int(np.argmax(dimensions))
+    x_hint = rotation[:, x_index]
     x_axis = x_hint - float(np.dot(x_hint, z_axis)) * z_axis
     if float(np.linalg.norm(x_axis)) < 1e-8:
         x_axis = np.asarray(current_tip_rotation, dtype=np.float64)[:, 0]
@@ -194,7 +225,7 @@ def build_surface_aligned_grasp_pose(
     result = np.eye(4, dtype=np.float64)
     result[:3, :3] = np.column_stack([x_axis, y_axis, z_axis])
     half_extent = 0.5 * float(
-        np.sum(np.abs(rotation.T @ approach) * np.asarray(dimensions_m, dtype=np.float64))
+        np.sum(np.abs(rotation.T @ approach) * dimensions)
     )
     result[:3, 3] = np.asarray(object_center_m, dtype=np.float64) + approach * (
         half_extent + float(standoff_m)
