@@ -1,4 +1,4 @@
-# End-to-end depth/proprioception PPO extension.
+# End-to-end depth/proprioception SAC/PPO and behavior-cloning extension.
 -r requirements.txt
 gymnasium>=0.29
 stable-baselines3>=2.3

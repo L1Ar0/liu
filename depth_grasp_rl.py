@@ -177,8 +177,12 @@ if torch is not None:
                 depth_space = observation_space.spaces["depth"]
                 proprio_space = observation_space.spaces["proprio"]
                 channels, height, width = depth_space.shape
+                # Explicit pixel coordinates make the fixed-camera lateral
+                # mapping easier to learn than translation-equivariant depth
+                # features alone.
+                self._depth_channels = int(channels)
                 self.cnn = nn.Sequential(
-                    nn.Conv2d(channels, 32, 5, stride=2, padding=2),
+                    nn.Conv2d(channels + 2, 32, 5, stride=2, padding=2),
                     nn.ReLU(),
                     nn.Conv2d(32, 64, 5, stride=2, padding=2),
                     nn.ReLU(),
@@ -188,7 +192,7 @@ if torch is not None:
                     nn.Flatten(),
                 )
                 with torch.no_grad():
-                    sample = torch.zeros(1, channels, height, width)
+                    sample = torch.zeros(1, channels + 2, height, width)
                     cnn_dim = int(self.cnn(sample).shape[1])
                 self.proprio = nn.Sequential(
                     nn.Linear(int(np.prod(proprio_space.shape)), 64),
@@ -202,7 +206,13 @@ if torch is not None:
             def forward(self, observations: dict[str, Any]) -> Any:
                 depth = observations["depth"].float()
                 proprio = observations["proprio"].float().flatten(start_dim=1)
-                return self.fusion(torch.cat((self.cnn(depth), self.proprio(proprio)), dim=1))
+                height, width = depth.shape[-2:]
+                x_coords = torch.linspace(-1.0, 1.0, width, device=depth.device, dtype=depth.dtype)
+                y_coords = torch.linspace(-1.0, 1.0, height, device=depth.device, dtype=depth.dtype)
+                x_coords = x_coords.view(1, 1, 1, width).expand(depth.shape[0], 1, height, width)
+                y_coords = y_coords.view(1, 1, height, 1).expand(depth.shape[0], 1, height, width)
+                depth_with_coords = torch.cat((depth, x_coords, y_coords), dim=1)
+                return self.fusion(torch.cat((self.cnn(depth_with_coords), self.proprio(proprio)), dim=1))
 
     else:
         DepthProprioFeaturesExtractor = None  # type: ignore

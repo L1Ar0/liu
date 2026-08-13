@@ -36,7 +36,6 @@ from depth_grasp_rl import (
     ROTATION_STEP_RAD,
     TRANSLATION_STEP_M,
     decode_cartesian_action,
-    normalize_depth,
 )
 
 
@@ -151,6 +150,8 @@ else:
             headless: bool = True,
             curriculum_stage: str = "E",
             execution_mode: str | None = None,
+            stage_a_position_mode: str = "canonical5",
+            stage_a_position_index: int | None = None,
         ) -> None:
             super().__init__()
             self.scene_mode = str(scene_mode or os.environ.get("ROBOT_GRASP_SCENE_MODE", "physics"))
@@ -163,6 +164,12 @@ else:
             self.curriculum_stage = str(curriculum_stage).upper()
             if self.curriculum_stage not in STAGE_CONFIGS:
                 raise ValueError("Curriculum stage must be A, B, C, D, or E")
+            self.stage_a_position_mode = str(stage_a_position_mode).lower()
+            if self.stage_a_position_mode not in {"canonical5", "grid3", "random"}:
+                raise ValueError("stage_a_position_mode must be canonical5, grid3, or random")
+            self.stage_a_position_index = (
+                None if stage_a_position_index is None else int(stage_a_position_index)
+            )
             self._pending_curriculum_stage = self.curriculum_stage
             self.execution_mode = self._normalize_execution_mode(execution_mode)
             self._seed = seed
@@ -199,13 +206,27 @@ else:
             self.object_records: list[dict[str, Any]] = []
             self._records_by_handle: dict[int, dict[str, Any]] = {}
             self._stage_reference_distance = 0.0
+            self._workspace_reference: dict[str, float] = {}
+            self._initial_distance = float("inf")
+            self._episode_approach_reward = 0.0
+            self._episode_ik_penalty = 0.0
+            self._episode_collision_penalty = 0.0
+            self._episode_smooth_penalty = 0.0
+            self._episode_step_penalty = 0.0
+            self._episode_ik_failure_count = 0
+            self._stage_a_position_index = -1
+            self._stage_a_position_name = "random"
 
-            self.action_space = spaces.Box(-1.0, 1.0, shape=(ACTION_DIM,), dtype=np.float32)
+            self._stage_action_dim = 2 if self.curriculum_stage == "A" else ACTION_DIM
+            proprio_dim = 14 if self.curriculum_stage == "A" else 27
+
+            self.action_space = spaces.Box(-1.0, 1.0, shape=(self._stage_action_dim,), dtype=np.float32)
             self.observation_space = spaces.Dict(
                 {
                     "depth": spaces.Box(0.0, 1.0, shape=(1, self.image_size, self.image_size), dtype=np.float32),
-                    # q(7), dq(7), gripper(1), previous action(7), stage one-hot(5)
-                    "proprio": spaces.Box(-1.0, 1.0, shape=(27,), dtype=np.float32),
+                    # Stage A only needs q(7) and dq(7); later stages retain
+                    # gripper, previous action and curriculum context.
+                    "proprio": spaces.Box(-1.0, 1.0, shape=(proprio_dim,), dtype=np.float32),
                 }
             )
 
@@ -286,6 +307,12 @@ else:
             self._restore_observation_pose()
             existing = randomizer.find_existing_test_objects(self.sim)
             reference = randomizer.load_or_create_reference(self.sim, self.robot_base, existing)
+            self._workspace_reference = {
+                "center_x": float(reference.get("workspace_center_x", 0.0)),
+                "center_y": float(reference.get("workspace_center_y", 0.0)),
+                "half_x": float(reference.get("workspace_half_x", randomizer.WORKSPACE_HALF_X)),
+                "half_y": float(reference.get("workspace_half_y", randomizer.WORKSPACE_HALF_Y)),
+            }
             self.table_plane = np.asarray(
                 [0.0, 0.0, 1.0, float(reference.get("table_z", 0.0))],
                 dtype=np.float64,
@@ -357,6 +384,7 @@ else:
 
                     planned_randomizer.PLANNED_OBJECT_COUNT = original_planned_count
             records = self._apply_curriculum_object_count(records, seed)
+            records = self._apply_stage_a_position_mode(records, seed)
             self.object_handles = [int(item["handle"]) for item in records if "handle" in item]
             self.object_records = list(records)
             self._records_by_handle = {
@@ -415,6 +443,11 @@ else:
             value = str(stage).upper()
             if value not in STAGE_CONFIGS:
                 raise ValueError("Curriculum stage must be A, B, C, D, or E")
+            if value != self.curriculum_stage:
+                raise RuntimeError(
+                    "Changing curriculum stage in-place is unsupported because action and "
+                    "observation dimensions differ. Create a new environment for each stage."
+                )
             self._pending_curriculum_stage = value
 
         def _curriculum_scene(self, seed: int | None) -> tuple[str, str | None]:
@@ -446,6 +479,50 @@ else:
             if remove:
                 self.sim.removeObjects(remove)
             return selected
+
+        def _apply_stage_a_position_mode(
+            self,
+            records: list[dict[str, Any]],
+            seed: int | None,
+        ) -> list[dict[str, Any]]:
+            if self.curriculum_stage != "A" or self.stage_a_position_mode == "random" or not records:
+                return records
+            reference = self._workspace_reference
+            center_x = float(reference.get("center_x", 0.0))
+            center_y = float(reference.get("center_y", 0.0))
+            # Stay comfortably inside the workspace/camera bounds for the
+            # overfit curricula. Object dimensions are at most about 60 mm.
+            offset_x = min(0.06, 0.55 * float(reference.get("half_x", 0.11)))
+            offset_y = min(0.05, 0.55 * float(reference.get("half_y", 0.09)))
+            if self.stage_a_position_mode == "canonical5":
+                offsets = ((0.0, 0.0), (-offset_x, 0.0), (offset_x, 0.0), (0.0, -offset_y), (0.0, offset_y))
+                position_names = ("center", "left", "right", "y_minus", "y_plus")
+            else:
+                offsets = tuple(
+                    (x, y)
+                    for y in (-offset_y, 0.0, offset_y)
+                    for x in (-offset_x, 0.0, offset_x)
+                )
+                position_names = tuple(f"grid_{index}" for index in range(len(offsets)))
+            rng = np.random.default_rng(seed)
+            position_index = (
+                int(rng.integers(0, len(offsets)))
+                if self.stage_a_position_index is None
+                else int(self.stage_a_position_index) % len(offsets)
+            )
+            dx, dy = offsets[position_index]
+            record = records[0]
+            handle = int(record["handle"])
+            position = np.asarray(record.get("position", [center_x, center_y, self.table_plane[3]]), dtype=np.float64)
+            position[:2] = [center_x + dx, center_y + dy]
+            self.sim.setObjectPosition(handle, position.tolist(), self.robot_base)
+            record["position"] = position.tolist()
+            record["stage_a_position_mode"] = self.stage_a_position_mode
+            record["stage_a_position_index"] = position_index
+            record["stage_a_position_name"] = position_names[position_index]
+            self._stage_a_position_index = position_index
+            self._stage_a_position_name = position_names[position_index]
+            return records
 
         def _randomize_object_dynamics(self, seed: int | None) -> None:
             rng = np.random.default_rng(seed)
@@ -703,20 +780,56 @@ else:
                 # is still useful for deterministic IK-only curriculum stages.
                 pass
 
+        def _table_relative_height(self, depth: np.ndarray) -> np.ndarray:
+            """Convert metric camera depth into vertical height above the table."""
+            height, width = depth.shape
+            params = self.camera_params or {
+                "fov_x": math.radians(60.0),
+                "fov_y": math.radians(45.0),
+                "near": 0.05,
+                "far": 1.5,
+            }
+            v, u = np.indices((height, width), dtype=np.float64)
+            x = np.zeros_like(u) if width <= 1 else 1.0 - 2.0 * u / (width - 1)
+            y = np.zeros_like(v) if height <= 1 else 1.0 - 2.0 * v / (height - 1)
+            rays_camera = np.stack(
+                (
+                    math.tan(float(params["fov_x"]) / 2.0) * x,
+                    math.tan(float(params["fov_y"]) / 2.0) * y,
+                    np.ones_like(x),
+                ),
+                axis=-1,
+            )
+            # The RGB-D sensor is mounted under RG2 and therefore moves with
+            # the wrist; refresh its pose for every visual observation.
+            base_camera = np.asarray(
+                self.sim.getObjectMatrix(self.camera, self.robot_base),
+                dtype=np.float64,
+            ).reshape(3, 4)
+            vertical_ray = rays_camera @ base_camera[2, :3]
+            base_z = float(base_camera[2, 3]) + np.asarray(depth, dtype=np.float64) * vertical_ray
+            valid = (
+                np.isfinite(depth)
+                & (depth > float(params["near"]))
+                & (depth < float(params["far"]))
+            )
+            height_map = np.where(valid, base_z - float(self.table_plane[3]), 0.0)
+            return np.clip(height_map / 0.10, 0.0, 1.0).astype(np.float32)
+
         def _capture_observation(self) -> dict[str, np.ndarray]:
             from point_cloud import capture_rgbd
 
             _rgb, depth, width, height = capture_rgbd(self.sim, self.camera, announce=False)
+            if self._depth_noise_std_m > 0.0:
+                depth = depth + self.np_random.normal(0.0, self._depth_noise_std_m, depth.shape).astype(np.float32)
+            height_map = self._table_relative_height(np.asarray(depth, dtype=np.float32))
             resized = np.asarray(
-                Image.fromarray(np.asarray(depth, dtype=np.float32), mode="F").resize(
+                Image.fromarray(height_map, mode="F").resize(
                     (self.image_size, self.image_size), Image.Resampling.BILINEAR
                 ),
                 dtype=np.float32,
             )
-            if self._depth_noise_std_m > 0.0:
-                resized = resized + self.np_random.normal(0.0, self._depth_noise_std_m, resized.shape).astype(np.float32)
-            params = self.camera_params or {"near": 0.05, "far": 1.5}
-            depth_state = normalize_depth(resized, params["near"], params["far"])[None, ...]
+            depth_state = np.clip(resized, 0.0, 1.0)[None, ...]
             q = np.asarray([self.sim.getJointPosition(joint) for joint in self.joints], dtype=np.float64)
             velocities = []
             for joint in self.joints:
@@ -726,11 +839,14 @@ else:
                     velocities.append(0.0)
             q_state = np.clip(q / math.pi, -1.0, 1.0)
             dq_state = np.clip(np.asarray(velocities, dtype=np.float64) / 10.0, -1.0, 1.0)
-            stage_one_hot = np.zeros(len(CURRICULUM_STAGES), dtype=np.float64)
-            stage_one_hot[STAGE_INDEX[self.curriculum_stage]] = 1.0
-            proprio = np.concatenate(
-                (q_state, dq_state, [self._gripper_state], self._previous_action, stage_one_hot)
-            ).astype(np.float32)
+            if self.curriculum_stage == "A":
+                proprio = np.concatenate((q_state, dq_state)).astype(np.float32)
+            else:
+                stage_one_hot = np.zeros(len(CURRICULUM_STAGES), dtype=np.float64)
+                stage_one_hot[STAGE_INDEX[self.curriculum_stage]] = 1.0
+                proprio = np.concatenate(
+                    (q_state, dq_state, [self._gripper_state], self._previous_action, stage_one_hot)
+                ).astype(np.float32)
             return {"depth": depth_state.astype(np.float32), "proprio": proprio}
 
         def _stage_target_point(self, handle: int) -> np.ndarray | None:
@@ -866,6 +982,31 @@ else:
             robot_shapes = self.sim.getObjectsInTree(self.robot_base, self.sim.sceneobject_shape, 0)
             return any(self._collision(int(robot), int(table)) for robot in robot_shapes for table in self._table_handles)
 
+        def _stage_table_collision(self, physical_collision: bool | None = None) -> bool:
+            """Return the table hazard used by reward shaping for this stage.
+
+            Stage A only moves the TCP laterally from a fixed, safe height.  A
+            full robot-shape/table collision query can therefore report a
+            permanent contact from a stationary arm link and turn every step
+            into the same large penalty.  Keep the physical query available
+            for diagnostics and later stages, while using the TCP height as
+            the Stage A safety boundary.
+            """
+            if self.curriculum_stage != "A":
+                return bool(self._table_collision() if physical_collision is None else physical_collision)
+            if self.tip is None or self.robot_base is None:
+                return bool(physical_collision) if physical_collision is not None else False
+            try:
+                tcp_position = np.asarray(
+                    self.sim.getObjectPosition(self.tip, self.robot_base),
+                    dtype=np.float64,
+                )
+                return bool(float(tcp_position[2]) < float(self.table_plane[3]) + 0.03)
+            except Exception:
+                # Preserve a conservative safety signal if the simulator
+                # cannot provide the TCP pose.
+                return bool(physical_collision) if physical_collision is not None else False
+
         def _attach(self, handle: int) -> None:
             if not self.connector_enabled or self.tip is None:
                 return
@@ -911,6 +1052,9 @@ else:
                 seed = int(self._base_seed) + self._episode_index * 1000003
             self._episode_index += 1
             super().reset(seed=int(seed))
+            if options is not None and "stage_a_position_index" in options:
+                requested_index = options["stage_a_position_index"]
+                self.stage_a_position_index = None if requested_index is None else int(requested_index)
             self._seed = seed
             self._previous_action.fill(0.0)
             if self._pending_curriculum_stage != self.curriculum_stage:
@@ -921,6 +1065,14 @@ else:
             self._previous_lift = 0.0
             self._previous_left_contact = False
             self._previous_right_contact = False
+            self._episode_approach_reward = 0.0
+            self._episode_ik_penalty = 0.0
+            self._episode_collision_penalty = 0.0
+            self._episode_smooth_penalty = 0.0
+            self._episode_step_penalty = 0.0
+            self._episode_ik_failure_count = 0
+            self._stage_a_position_index = -1
+            self._stage_a_position_name = "random"
             self.connector_handle = None
             self.attached_handle = None
             self.attached_initial_z = None
@@ -935,6 +1087,7 @@ else:
             _handle, _ = self._nearest_object()
             distance = self._target_distance()
             self._previous_distance = distance
+            self._initial_distance = distance
             return self._capture_observation(), {
                 "object_count": len(self.object_handles),
                 "seed": seed,
@@ -943,18 +1096,50 @@ else:
                 "rollout_dynamics": self.execution_mode == "dynamic",
                 "grasp_proxy": "connector" if self.connector_enabled else "none",
                 "curriculum_stage": self.curriculum_stage,
+                "stage_a_position_mode": self.stage_a_position_mode if self.curriculum_stage == "A" else "random",
+                "stage_a_position_index": self._stage_a_position_index,
+                "stage_a_position_name": self._stage_a_position_name,
+                "initial_distance_m": distance,
                 "target_handle_hidden": True,
             }
+
+        def stage_a_expert_action(self) -> np.ndarray:
+            """Ground-truth teacher used only to collect Stage A demonstrations."""
+            if self.curriculum_stage != "A":
+                raise RuntimeError("The built-in expert currently supports Stage A only")
+            if self.tip is None or self.robot_base is None or self.episode_target_handle is None:
+                raise RuntimeError("reset() must create a Stage A target before requesting an expert action")
+            tip = np.asarray(
+                self.sim.getObjectPosition(self.tip, self.robot_base),
+                dtype=np.float64,
+            )
+            target = self._stage_target_point(self.episode_target_handle)
+            if target is None:
+                raise RuntimeError("Unable to query the Stage A target")
+            delta = target[:2] - tip[:2]
+            norm = float(np.linalg.norm(delta))
+            if norm <= curriculum_stage_config("A").distance_tolerance_m:
+                return np.zeros(2, dtype=np.float32)
+            # Preserve direction while allowing the expert to take the largest
+            # collision-free Cartesian increment supported by the environment.
+            action = delta / max(TRANSLATION_STEP_M, 1e-6)
+            max_component = max(1.0, float(np.max(np.abs(action))))
+            return np.clip(action / max_component, -1.0, 1.0).astype(np.float32)
 
         def step(self, action: np.ndarray) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
             if self.ik is None:
                 raise RuntimeError("reset() must be called before step()")
             config = curriculum_stage_config(self.curriculum_stage)
-            policy_action = np.asarray(action, dtype=np.float32).reshape(ACTION_DIM)
-            policy_action = np.clip(policy_action, -1.0, 1.0)
-            action_mask = np.asarray(config.action_mask, dtype=np.float32)
-            inactive_action = policy_action * (1.0 - action_mask)
-            executed_action = policy_action * action_mask
+            raw_action = np.asarray(action, dtype=np.float32).reshape(self._stage_action_dim)
+            raw_action = np.clip(raw_action, -1.0, 1.0)
+            if self.curriculum_stage == "A":
+                executed_action = np.zeros(ACTION_DIM, dtype=np.float32)
+                executed_action[:2] = raw_action
+                inactive_action = np.zeros(ACTION_DIM, dtype=np.float32)
+            else:
+                action_mask = np.asarray(config.action_mask, dtype=np.float32)
+                executed_action = raw_action * action_mask
+                inactive_action = raw_action * (1.0 - action_mask)
             translation, rotvec, gripper = decode_cartesian_action(executed_action)
             current = self.ik.current_pose()
             target = current.copy()
@@ -980,7 +1165,12 @@ else:
             elif gripper > 0.5:
                 self._set_gripper(1.0)
 
-            candidate, left_hit, right_hit = self._contact_candidate()
+            if self.curriculum_stage == "A":
+                candidate, left_hit, right_hit = None, False, False
+            else:
+                candidate, left_hit, right_hit = self._contact_candidate()
+            physical_table_collision = False if self.curriculum_stage == "A" else self._table_collision()
+            table_collision = self._stage_table_collision(physical_table_collision)
             tcp_to_object = float("inf")
             if candidate is not None:
                 tcp = np.asarray(self.sim.getObjectPosition(self.tip, self.robot_base), dtype=np.float64)
@@ -996,7 +1186,7 @@ else:
                 and candidate is not None
                 and self._between_fingers(candidate)
                 and tcp_to_object <= 0.075
-                and not self._table_collision()
+                and not physical_table_collision
             ):
                 if self.attached_handle is None:
                     self._attach(candidate)
@@ -1017,7 +1207,7 @@ else:
                 and self._gripper_state > 0.0
                 and self._between_fingers(candidate)
                 and tcp_to_object <= config.distance_tolerance_m
-                and not self._table_collision()
+                and not physical_table_collision
             )
             lift = self._lift_progress()
             if lift >= 0.015:
@@ -1027,27 +1217,41 @@ else:
             grasp_success = self.attached_handle is not None and self._lift_hold_count >= 3
             dropped = released or (self.attached_handle is not None and self._gripper_state < 0.0)
             joint_limit = self._joint_limit_violation()
-            smoothness = float(np.mean(np.square(executed_action - self._previous_action)))
+            action_for_smoothness = executed_action[:2] if self.curriculum_stage == "A" else executed_action
+            previous_for_smoothness = self._previous_action[:2] if self.curriculum_stage == "A" else self._previous_action
+            smoothness = float(np.mean(np.square(action_for_smoothness - previous_for_smoothness)))
             approach_progress = float(np.clip(distance_progress / max(TRANSLATION_STEP_M, 1e-6), -1.0, 1.0))
-            reward = config.approach_gain * approach_progress
-            reward = float(np.clip(reward, -config.approach_clip, config.approach_clip))
-            reward -= config.smoothness_weight * smoothness
-            reward -= config.step_penalty
-            reward -= config.collision_penalty if collision or self._table_collision() else 0.0
-            reward -= config.ik_penalty if ik_failed else 0.0
-            reward -= config.joint_limit_penalty if joint_limit else 0.0
-            reward -= config.inactive_action_penalty * float(np.mean(np.square(inactive_action)))
+            approach_reward = config.approach_gain * approach_progress
+            approach_reward = float(np.clip(approach_reward, -config.approach_clip, config.approach_clip))
+            smooth_penalty = config.smoothness_weight * smoothness
+            step_penalty = float(config.step_penalty)
+            collision_penalty = float(config.collision_penalty) if collision or table_collision else 0.0
+            ik_penalty = float(config.ik_penalty) if ik_failed else 0.0
+            joint_penalty = float(config.joint_limit_penalty) if joint_limit else 0.0
+            inactive_action_penalty = config.inactive_action_penalty * float(np.mean(np.square(inactive_action)))
+            reward = (
+                approach_reward
+                - smooth_penalty
+                - step_penalty
+                - collision_penalty
+                - ik_penalty
+                - joint_penalty
+                - inactive_action_penalty
+            )
+            left_contact_reward = 0.0
             if left_hit and not self._previous_left_contact:
-                reward += config.one_side_contact_reward
+                left_contact_reward += config.one_side_contact_reward
+            right_contact_reward = 0.0
             if right_hit and not self._previous_right_contact:
-                reward += config.one_side_contact_reward
+                right_contact_reward += config.one_side_contact_reward
+            bilateral_reward = 0.0
             if bilateral and self._gripper_state > 0.0 and not (
                 self._previous_left_contact and self._previous_right_contact
             ):
-                reward += config.bilateral_reward
-            reward += config.connector_reward if connector_created else 0.0
+                bilateral_reward = config.bilateral_reward
+            connector_reward = float(config.connector_reward) if connector_created else 0.0
             lift_progress = max(0.0, lift - self._previous_lift)
-            reward += config.lift_progress_gain * min(lift_progress / 0.015, 1.0)
+            lift_reward = config.lift_progress_gain * min(lift_progress / 0.015, 1.0)
             self._previous_lift = lift
             task_success = stage_task_success(
                 self.curriculum_stage,
@@ -1055,10 +1259,19 @@ else:
                 stage_contact_success=stage_contact_success,
                 stage_distance_success=stage_distance_success,
             )
-            reward += config.success_reward if task_success else 0.0
-            reward -= config.premature_close_penalty if (
+            success_reward = float(config.success_reward) if task_success else 0.0
+            premature_close_penalty = config.premature_close_penalty if (
                 self._gripper_state > 0.0 and not bilateral and self.curriculum_stage in {"A", "B"}
             ) else 0.0
+            reward += (
+                left_contact_reward
+                + right_contact_reward
+                + bilateral_reward
+                + connector_reward
+                + lift_reward
+                + success_reward
+                - premature_close_penalty
+            )
             self._previous_left_contact = left_hit
             self._previous_right_contact = right_hit
             self._previous_action = np.clip(executed_action, -1.0, 1.0)
@@ -1068,10 +1281,18 @@ else:
                 or task_success
             )
             truncated = bool(not terminated and self._step_count >= self.max_steps)
-            if truncated:
-                reward -= config.timeout_penalty
+            timeout_penalty = float(config.timeout_penalty) if truncated else 0.0
+            reward -= timeout_penalty
+            self._episode_approach_reward += approach_reward
+            self._episode_ik_penalty += ik_penalty
+            self._episode_collision_penalty += collision_penalty
+            self._episode_smooth_penalty += smooth_penalty
+            self._episode_step_penalty += step_penalty
+            self._episode_ik_failure_count += int(ik_failed)
             info = {
                 "distance_m": distance,
+                "final_distance_m": distance,
+                "initial_distance_m": self._initial_distance,
                 "distance_progress_m": distance_progress,
                 "bilateral_contact": bilateral,
                 "left_contact": left_hit,
@@ -1080,16 +1301,46 @@ else:
                 "lift_m": lift,
                 "grasp_success": grasp_success,
                 "dropped": dropped,
-                "collision": collision or self._table_collision(),
+                "collision": collision or physical_table_collision,
+                "table_collision": physical_table_collision,
+                "reward_table_collision": table_collision,
                 "ik_failed": ik_failed,
                 "joint_limit": joint_limit,
                 "step": self._step_count,
+                "episode_steps": self._step_count,
+                "timeout": truncated,
                 "curriculum_stage": self.curriculum_stage,
                 "target_handle": self.episode_target_handle,
+                "stage_a_position_index": self._stage_a_position_index,
+                "stage_a_position_name": self._stage_a_position_name,
                 "stage_distance_success": stage_distance_success,
                 "stage_contact_success": stage_contact_success,
                 "task_success": task_success,
                 "inactive_action_norm": float(np.linalg.norm(inactive_action)),
+                # Reward components make constant per-step penalties visible
+                # without reconstructing them from episode means.
+                "approach_reward": approach_reward,
+                "smooth_penalty": smooth_penalty,
+                "step_penalty": step_penalty,
+                "collision_penalty": collision_penalty,
+                "ik_penalty": ik_penalty,
+                "joint_penalty": joint_penalty,
+                "inactive_action_penalty": inactive_action_penalty,
+                "left_contact_reward": left_contact_reward,
+                "right_contact_reward": right_contact_reward,
+                "bilateral_reward": bilateral_reward,
+                "connector_reward": connector_reward,
+                "lift_reward": lift_reward,
+                "success_reward": success_reward,
+                "premature_close_penalty": premature_close_penalty,
+                "timeout_penalty": timeout_penalty,
+                "reward_total": float(reward),
+                "ep_approach_reward": self._episode_approach_reward,
+                "ep_ik_penalty": self._episode_ik_penalty,
+                "ep_collision_penalty": self._episode_collision_penalty,
+                "ep_smooth_penalty": self._episode_smooth_penalty,
+                "ep_step_penalty": self._episode_step_penalty,
+                "ik_failure_count": self._episode_ik_failure_count,
             }
             return self._capture_observation(), float(reward), terminated, truncated, info
 

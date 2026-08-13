@@ -11,7 +11,7 @@ from primitive_fitting import fit_primitive_candidates
 from shape_catalog import CAD_DIMENSIONS_M, get_cad_dimensions
 from grasp_planning import annotate_grasp_planning
 from depth_grasp_rl import action_reward, encode_action, normalize_depth
-from end_to_end_grasp_env import STAGE_CONFIGS, pregrasp_target_point, stage_task_success
+from end_to_end_grasp_env import EndToEndGraspEnv, STAGE_CONFIGS, pregrasp_target_point, stage_task_success
 from planned_scene_randomizer import _obb_penetrates, build_planned_layout
 
 
@@ -116,6 +116,36 @@ class PrimitiveFittingTests(unittest.TestCase):
 
 
 class ExchangeContractTests(unittest.TestCase):
+    def test_stage_a_uses_true_two_dimensional_policy_space(self) -> None:
+        env = EndToEndGraspEnv(curriculum_stage="A")
+        self.assertEqual(env.action_space.shape, (2,))
+        self.assertEqual(env.observation_space["proprio"].shape, (14,))
+
+    def test_later_stage_retains_full_policy_space(self) -> None:
+        env = EndToEndGraspEnv(curriculum_stage="B")
+        self.assertEqual(env.action_space.shape, (7,))
+        self.assertEqual(env.observation_space["proprio"].shape, (27,))
+
+    def test_table_relative_height_is_bounded_and_table_zeroed(self) -> None:
+        class FakeSim:
+            @staticmethod
+            def getObjectMatrix(_camera, _robot_base):
+                return [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+
+        env = EndToEndGraspEnv(curriculum_stage="A", image_size=4)
+        env.sim = FakeSim()
+        env.camera = 1
+        env.robot_base = 2
+        env.table_plane = np.asarray([0.0, 0.0, 1.0, 0.05], dtype=np.float64)
+        env.camera_params = {
+            "fov_x": np.deg2rad(60.0),
+            "fov_y": np.deg2rad(45.0),
+            "near": 0.01,
+            "far": 1.0,
+        }
+        height = env._table_relative_height(np.asarray([[0.05, 0.10, 0.20]], dtype=np.float32))
+        np.testing.assert_allclose(height, [[0.0, 0.5, 1.0]], atol=1e-6)
+
     def test_curriculum_success_is_stage_specific(self) -> None:
         self.assertTrue(stage_task_success("A", grasp_success=False, stage_contact_success=False, stage_distance_success=True))
         self.assertFalse(stage_task_success("D", grasp_success=False, stage_contact_success=False, stage_distance_success=True))

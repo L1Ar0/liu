@@ -18,6 +18,8 @@ random_scene_contacts.json
 depth_grasp_dataset.npz
 depth_grasp_dataset.json
 depth_grasp_rl_output/
+end_to_end_grasp_rl_output/
+*.pkl
 complex_benchmark_output/
 visual_servo_6d_output/
 

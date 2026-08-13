@@ -1,4 +1,4 @@
-"""Execute a trained end-to-end PPO grasp policy in CoppeliaSim."""
+"""Execute a trained SAC or PPO grasp policy in CoppeliaSim."""
 
 from __future__ import annotations
 
@@ -13,11 +13,14 @@ ROOT = Path(__file__).resolve().parent
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True, help="SB3 .zip checkpoint")
+    parser.add_argument("--algorithm", choices=("sac", "ppo"), default="sac")
     parser.add_argument("--episodes", type=int, default=1)
-    parser.add_argument("--max-steps", type=int, default=80)
+    parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--scene-mode", default="physics")
     parser.add_argument("--planned-layout", default="auto")
     parser.add_argument("--stage", choices=("A", "B", "C", "D", "E"), default="E")
+    parser.add_argument("--stage-a-position-mode", choices=("canonical5", "grid3", "random"), default="canonical5")
+    parser.add_argument("--stage-a-position-index", type=int, default=None)
     parser.add_argument(
         "--execution-mode",
         default="settle_then_kinematic",
@@ -34,22 +37,26 @@ def main() -> int:
     if args.episodes <= 0:
         raise SystemExit("--episodes must be positive")
     try:
-        from stable_baselines3 import PPO
+        from stable_baselines3 import PPO, SAC
         from end_to_end_grasp_env import EndToEndGraspEnv
     except ImportError as exc:
         raise SystemExit("Install requirements-rl.txt before running the policy.") from exc
 
-    model = PPO.load(str(args.checkpoint), device=args.device)
+    algorithm_class = SAC if args.algorithm == "sac" else PPO
+    model = algorithm_class.load(str(args.checkpoint), device=args.device)
+    max_steps = int(args.max_steps if args.max_steps is not None else (30 if args.stage == "A" else 80))
     results: list[dict[str, object]] = []
     for episode in range(int(args.episodes)):
         env = EndToEndGraspEnv(
             scene_mode=args.scene_mode,
             planned_layout=args.planned_layout if args.planned_layout != "auto" else None,
-            max_steps=args.max_steps,
+            max_steps=max_steps,
             seed=int(args.seed) + episode * 7919,
             headless=False,
             execution_mode=args.execution_mode,
             curriculum_stage=args.stage,
+            stage_a_position_mode=args.stage_a_position_mode,
+            stage_a_position_index=args.stage_a_position_index,
         )
         observation, info = env.reset(seed=int(args.seed) + episode * 7919)
         total_reward = 0.0
@@ -82,6 +89,7 @@ def main() -> int:
         print(json.dumps(results[-1], ensure_ascii=False, indent=2))
     payload = {
         "checkpoint": str(args.checkpoint.resolve()),
+        "algorithm": args.algorithm,
         "stage": args.stage,
         "execution_mode": args.execution_mode,
         "episodes": results,
