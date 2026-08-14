@@ -72,9 +72,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--servo-dynamics-mode",
-        choices=("position", "torque"),
+        choices=("position", "velocity", "torque"),
         default=os.environ.get("ROBOT_GRASP_DYNAMICS_MODE", "position"),
-        help="dynamic actuator mode; position is the commissioning mode, torque is the impedance-like mode",
+        help=(
+            "dynamic actuator mode; position is the validated force-limited "
+            "MuJoCo mode, torque/velocity are available for commissioning"
+        ),
     )
     parser.add_argument(
         "--servo-target-id",
@@ -178,6 +181,16 @@ def main() -> None:
     environment["ROBOT_GRASP_USE_CONNECTOR"] = "0" if args.no_connector else "1"
     environment["ROBOT_GRASP_DYNAMICS_CONTROL"] = "1" if args.servo_dynamics else "0"
     environment["ROBOT_GRASP_DYNAMICS_MODE"] = str(args.servo_dynamics_mode)
+    if args.servo_dynamics:
+        # A physical grasp must keep the seven-joint controller alive through
+        # RG2 contact and the first lift steps.  Releasing it here would make
+        # the subsequent lift fall back to an IK shadow that no longer matches
+        # the MuJoCo arm.
+        environment["ROBOT_GRASP_DYNAMIC_ARM_DURING_RG2_CLOSE"] = "1"
+        environment.setdefault("ROBOT_GRASP_DYNAMIC_POSITION_FALLBACK_TORQUE", "0")
+    # A physics scene is intentionally paused after settling.  Ensure the
+    # first RGB-D request receives a rendered frame before segmentation.
+    environment["ROBOT_GRASP_REFRESH_VISION_ON_PAUSE"] = "1"
     environment["ROBOT_GRASP_SERVO_GRASP_ORIENTATION"] = args.servo_grasp_orientation
     environment["ROBOT_GRASP_SERVO_TARGET_POLICY"] = args.servo_target_policy
     environment["ROBOT_GRASP_SERVO_LIFT_M"] = str(

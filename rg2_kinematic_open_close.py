@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 
 
 # ============================================================

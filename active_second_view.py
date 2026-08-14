@@ -18,7 +18,7 @@ from typing import Any
 
 import numpy as np
 import open3d as o3d
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 from scipy.spatial.transform import Rotation, Slerp
 
 from geometric_segmentation import refine_geometric_clusters
@@ -166,7 +166,12 @@ def _move_camera_to_second_view(
         raise RuntimeError(f"Expected 7 arm joints, found {len(joints)}")
     limits = get_joint_limits(sim, joints)
     original_positions = [float(sim.getJointPosition(joint)) for joint in joints]
-    original_modes = [sim.getJointMode(joint) for joint in joints]
+    original_modes = []
+    for joint in joints:
+        raw_mode = sim.getJointMode(joint)
+        original_modes.append(
+            int(raw_mode[0] if isinstance(raw_mode, (tuple, list)) else raw_mode)
+        )
     target_dummy = int(sim.createDummy(0.015))
     ik_environment = None
 
@@ -265,6 +270,21 @@ def _move_camera_to_second_view(
         for joint, mode in zip(joints, original_modes):
             try:
                 sim.setJointMode(joint, mode)
+            except Exception:
+                pass
+        # The view motion is kinematic, but dynamic proxy links can retain a
+        # stale solver velocity from an interrupted previous run.  Clear only
+        # the robot descendant bodies while the scene is paused; workpieces
+        # and their settled contacts are left untouched.
+        set_velocity = getattr(sim, "setObjectVelocity", None)
+        if set_velocity is not None:
+            try:
+                robot_shapes = sim.getObjectsInTree(robot_base, sim.sceneobject_shape, 0)
+                for handle in robot_shapes:
+                    try:
+                        set_velocity(int(handle), [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+                    except Exception:
+                        pass
             except Exception:
                 pass
         if ik_environment is not None:

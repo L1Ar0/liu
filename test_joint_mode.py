@@ -1,6 +1,6 @@
 import os
 
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 
 
 print("当前运行文件：")

@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 
 from point_cloud import (
     find_unique_object_by_alias,
@@ -1092,6 +1092,7 @@ def generate_random_scene(
     robot_base: int,
     reference: dict,
     camera_model: dict[str, Any],
+    client: Any | None = None,
 ) -> list[dict]:
     if SCENE_MODE in {"physics", "dynamic", "settled", "drop"}:
         # Import lazily to keep the validated static baseline independent from
@@ -1103,6 +1104,7 @@ def generate_random_scene(
             robot_base,
             reference,
             camera_model,
+            client=client,
         )
 
     if SCENE_MODE in {"planned", "constraint", "planned_contact"}:
@@ -1837,6 +1839,7 @@ def main() -> None:
         robot_base,
         reference,
         camera_model,
+        client=client,
     )
 
     save_scene_ground_truth(

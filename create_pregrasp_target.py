@@ -1,4 +1,4 @@
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 
 
 # 初始测试时，让目标点位于方块中心上方 30 cm

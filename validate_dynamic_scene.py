@@ -18,7 +18,7 @@ from typing import Any
 
 import numpy as np
 
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 from joint_torque_controller import JointTorqueController, TorqueControllerConfig
 
 
@@ -249,8 +249,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--control-mode",
-        choices=("position", "torque"),
-        default="position",
+        choices=("position", "velocity", "torque"),
+        default="velocity",
         help="actuator mode used by --hold-steps",
     )
     parser.add_argument("--json", type=Path, help="optional report output path")

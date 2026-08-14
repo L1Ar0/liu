@@ -4,7 +4,7 @@ import math
 import time
 from typing import Any, Sequence
 
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 
 
 # ============================================================
@@ -715,4 +715,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    

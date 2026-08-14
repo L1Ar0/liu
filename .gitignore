@@ -20,6 +20,8 @@ depth_grasp_dataset.json
 depth_grasp_rl_output/
 complex_benchmark_output/
 visual_servo_6d_output/
+robot_dynamic_state.json
+dynamic_*.json
 
 # Review-only external source copies, not part of the project.
 .codex_review/

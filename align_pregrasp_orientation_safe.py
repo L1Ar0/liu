@@ -3,7 +3,7 @@ import os
 import time
 import traceback
 
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 
 
 # ============================================================
@@ -1379,4 +1379,3 @@ if __name__ == "__main__":
         print("3. iiwa_target 必须位于合理的预抓取位置")
         print("4. 七个关节必须设置有限的真实上下限")
         print("5. 如果没有安全解，请移动方块或提高预抓取高度")
-        

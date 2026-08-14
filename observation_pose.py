@@ -7,9 +7,16 @@ import json
 import math
 from pathlib import Path
 
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 
 from point_cloud import find_unique_object_by_alias, get_kuka_joints_from_tip
+from robot_state import (
+    MANIFEST_FILE,
+    capture as capture_robot_state,
+    load_compatible as load_robot_state,
+    reset_for_observation,
+    save as save_robot_state,
+)
 
 
 POSE_FILE = Path("camera_output") / "initial_observation_joints.json"
@@ -50,8 +57,18 @@ def restore(sim, joints) -> None:
     values = [float(value) for value in payload["joint_positions_rad"]]
     if len(values) != len(joints):
         raise RuntimeError("Saved observation pose has the wrong joint count")
-    for joint, value in zip(joints, values):
-        sim.setJointPosition(joint, value)
+    robot_base = int(sim.getObjectParent(joints[0]))
+    manifest = load_robot_state(sim, robot_base)
+    # A manifest belongs to the current scene tree, not to a generated
+    # workpiece scene.  If it is missing (first run or a manually edited
+    # scene), capture the tuned baseline once.  The helper freezes every
+    # descendant shape before assigning q, which prevents a stale dynamic body
+    # from pulling the arm apart during reset.
+    if manifest is None:
+        manifest = capture_robot_state(sim, robot_base)
+        save_robot_state(manifest)
+    reset_for_observation(sim, robot_base, joints, values, manifest)
+    print(f"Robot dynamic state normalized from {MANIFEST_FILE.resolve()}")
     print(
         "Initial observation pose restored: "
         + ", ".join(f"{math.degrees(value):.2f} deg" for value in values)

@@ -2,7 +2,7 @@ import math
 import time
 from typing import Any, Iterable
 
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 
 
 # ============================================================

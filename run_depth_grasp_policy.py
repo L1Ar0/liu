@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 
 from depth_grasp_rl import (
     ACTION_DIM,

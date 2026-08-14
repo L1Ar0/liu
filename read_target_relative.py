@@ -1,6 +1,6 @@
 import math
 
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 
 
 def format_vector(name: str, vector: list[float]) -> None:

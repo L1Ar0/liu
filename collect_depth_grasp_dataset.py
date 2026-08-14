@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 from PIL import Image
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 
 from depth_grasp_rl import STATE_SIZE, encode_action, normalize_depth
 from point_cloud import (

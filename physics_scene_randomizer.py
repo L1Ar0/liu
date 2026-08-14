@@ -26,6 +26,7 @@ from shape_catalog import (
     get_cad_dimensions,
     get_shape_spec,
 )
+from robot_state import capture as capture_robot_state, load_compatible as load_robot_state, save as save_robot_state
 
 
 CONTACT_FILE = Path("random_scene_contacts.json")
@@ -115,6 +116,29 @@ def _restore_robot_collisions(sim: Any, saved: list[tuple[int, int]]) -> None:
 
 
 def _capture_robot_configuration(sim: Any, robot_base: int) -> dict[str, Any]:
+    # ``robot_base`` contains the RG2 subtree as well.  Do not treat RG2's
+    # dependent/spherical/openClose joints as iiwa arm joints: changing their
+    # mode during scene settling breaks the stock RG2 child-script model.
+    from point_cloud import find_unique_object_by_alias, get_kuka_joints_from_tip
+
+    gripper_tip = find_unique_object_by_alias(
+        sim,
+        sim.sceneobject_dummy,
+        "gripper_tip",
+    )
+    arm_joint_handles = set(int(handle) for handle in get_kuka_joints_from_tip(sim, gripper_tip))
+    if len(arm_joint_handles) != 7:
+        raise RuntimeError(
+            "Expected exactly seven iiwa joints while capturing the robot "
+            f"configuration, found {len(arm_joint_handles)}"
+        )
+    # Keep a scene-level snapshot so the dynamic controller can restore the
+    # exact tuned shape set instead of inferring it from aliases.  This also
+    # repairs flags left behind by an interrupted previous run.
+    manifest = load_robot_state(sim, robot_base)
+    if manifest is None:
+        manifest = capture_robot_state(sim, robot_base)
+        save_robot_state(manifest)
     joints: list[tuple[int, float]] = []
     joint_modes: list[tuple[int, int]] = []
     joint_dynctrl_modes: list[tuple[int, int | None]] = []
@@ -122,6 +146,8 @@ def _capture_robot_configuration(sim: Any, robot_base: int) -> dict[str, Any]:
     dynctrl_param = getattr(sim, "jointintparam_dynctrlmode", None)
     for handle in sim.getObjectsInTree(robot_base, sim.sceneobject_joint, 0):
         handle = int(handle)
+        if handle not in arm_joint_handles:
+            continue
         try:
             joints.append((handle, float(sim.getJointPosition(handle))))
         except Exception:
@@ -149,6 +175,15 @@ def _capture_robot_configuration(sim: Any, robot_base: int) -> dict[str, Any]:
         "joints": joints,
         "joint_modes": joint_modes,
         "joint_dynctrl_modes": joint_dynctrl_modes,
+        "shape_static_flags": [
+            (
+                int(handle),
+                _get_shape_flag(sim, int(handle), "shapeintparam_static", 1),
+                _get_shape_flag(sim, int(handle), "shapeintparam_respondable", 0),
+            )
+            for handle in sim.getObjectsInTree(robot_base, sim.sceneobject_shape, 0)
+        ],
+        "robot_state_manifest": manifest,
     }
 
 
@@ -175,6 +210,25 @@ def _set_robot_kinematic_for_settle(sim: Any, configuration: dict[str, Any]) -> 
                     pass
         except Exception:
             continue
+
+
+def _freeze_robot_shapes_for_settle(sim: Any, configuration: dict[str, Any]) -> None:
+    """Temporarily make the full arm/gripper collision tree static.
+
+    A kinematic joint alone does not guarantee that dynamic proxy links stay
+    suspended while the physics engine settles workpieces.  Freezing the
+    saved robot shapes removes that uncommanded gravity phase.  The original
+    static/respondable flags are restored while the simulation is paused,
+    before the real controller takes ownership.
+    """
+    for handle, _static, _respondable in configuration.get("shape_static_flags", []):
+        _set_shape_flag(sim, int(handle), "shapeintparam_static", 1)
+
+
+def _restore_robot_shape_flags(sim: Any, configuration: dict[str, Any]) -> None:
+    for handle, static, respondable in configuration.get("shape_static_flags", []):
+        _set_shape_flag(sim, int(handle), "shapeintparam_static", int(static))
+        _set_shape_flag(sim, int(handle), "shapeintparam_respondable", int(respondable))
 
 
 def _restore_joint_configuration(sim: Any, configuration: dict[str, Any]) -> None:
@@ -213,6 +267,27 @@ def _restore_robot_configuration(
     except Exception:
         pass
     _restore_joint_configuration(sim, configuration)
+    # Keep the arm kinematic until the visual-servo execution layer explicitly
+    # creates JointTorqueController.  Restoring a dynamic mode here would let
+    # gravity act during the perception/second-view stages with no controller.
+    _set_robot_kinematic_for_settle(sim, configuration)
+
+
+def _zero_robot_velocities(sim: Any, robot_base: int) -> None:
+    """Clear residual dynamic velocities while the scene is paused."""
+    set_velocity = getattr(sim, "setObjectVelocity", None)
+    if set_velocity is None:
+        return
+    for handle in sim.getObjectsInTree(robot_base, sim.sceneobject_shape, 0):
+        try:
+            # The simulation is paused here, so isDynamicallyEnabled can
+            # legitimately report false even when the body will be enabled on
+            # the next start.  Clear every descendant shape instead of using
+            # that flag as a gate; static/visual shapes simply reject the call
+            # and are ignored.
+            set_velocity(int(handle), [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+        except Exception:
+            pass
 
 
 def _set_engine_float(sim: Any, handle: int, parameter_name: str, value: float) -> None:
@@ -235,6 +310,24 @@ def _set_engine_bool(sim: Any, handle: int, parameter_name: str, value: bool) ->
         pass
 
 
+def _set_engine_int(sim: Any, handle: int, parameter_name: str, value: int) -> None:
+    parameter = getattr(sim, parameter_name, None)
+    if parameter is None:
+        return
+    try:
+        sim.setEngineInt32Param(parameter, handle, int(value))
+    except Exception:
+        pass
+
+
+def _physics_engine(sim: Any) -> int | None:
+    """Return CoppeliaSim's active dynamics engine, if available."""
+    try:
+        return int(sim.getInt32Param(sim.intparam_dynamic_engine))
+    except Exception:
+        return None
+
+
 def _set_dynamic(sim: Any, handle: int, dynamic: bool) -> None:
     _set_shape_flag(sim, handle, "shapeintparam_static", 0 if dynamic else 1)
     _set_shape_flag(sim, handle, "shapeintparam_respondable", 1)
@@ -244,39 +337,49 @@ def _set_dynamic(sim: Any, handle: int, dynamic: bool) -> None:
         "shapeintparam_respondable_mask",
         DROP_COLLISION_BIT,
     )
-    _set_engine_float(
-        sim,
-        handle,
-        "bullet_body_friction",
-        float(os.environ.get("ROBOT_GRASP_PHYSICS_FRICTION", "1.2")),
-    )
-    _set_engine_float(
-        sim,
-        handle,
-        "bullet_body_restitution",
-        float(os.environ.get("ROBOT_GRASP_PHYSICS_RESTITUTION", "0.0")),
-    )
-    _set_engine_bool(
-        sim,
-        handle,
-        "bullet_body_sticky",
-        os.environ.get("ROBOT_GRASP_PHYSICS_STICKY", "1").lower()
-        not in {"0", "false", "no"},
-    )
+    friction = float(os.environ.get("ROBOT_GRASP_PHYSICS_FRICTION", "1.2"))
+    restitution = float(os.environ.get("ROBOT_GRASP_PHYSICS_RESTITUTION", "0.0"))
+    engine = _physics_engine(sim)
+    mujoco_engine = getattr(sim, "physics_mujoco", 4)
+    if engine == int(mujoco_engine):
+        # Bullet material parameters are silently ignored by MuJoCo.  Set
+        # MuJoCo's three contact friction coefficients instead, and use a
+        # finite contact dimension so primitive contacts do not chatter.
+        _set_engine_float(sim, handle, "mujoco_body_friction1", max(0.0, friction))
+        _set_engine_float(sim, handle, "mujoco_body_friction2", max(0.0, 0.05 * friction))
+        _set_engine_float(sim, handle, "mujoco_body_friction3", max(0.0, 0.01 * friction))
+        _set_engine_float(sim, handle, "mujoco_body_margin", 0.0005)
+        _set_engine_int(sim, handle, "mujoco_body_condim", 3)
+        # MuJoCo does not have Bullet restitution/sticky flags.  A compliant
+        # contact reference prevents the high-frequency bounce that otherwise
+        # keeps the settle monitor above its angular-speed threshold.
+        _set_engine_float(sim, handle, "mujoco_body_solref1", 0.04)
+        _set_engine_float(sim, handle, "mujoco_body_solref2", 1.0)
+    else:
+        _set_engine_float(sim, handle, "bullet_body_friction", friction)
+        _set_engine_float(sim, handle, "bullet_body_restitution", restitution)
+        _set_engine_bool(
+            sim,
+            handle,
+            "bullet_body_sticky",
+            os.environ.get("ROBOT_GRASP_PHYSICS_STICKY", "1").lower()
+            not in {"0", "false", "no"},
+        )
 
     if dynamic:
-        _set_engine_float(
-            sim,
-            handle,
-            "bullet_body_lineardamping",
-            float(os.environ.get("ROBOT_GRASP_PHYSICS_LINEAR_DAMPING", "0.08")),
-        )
-        _set_engine_float(
-            sim,
-            handle,
-            "bullet_body_angulardamping",
-            float(os.environ.get("ROBOT_GRASP_PHYSICS_ANGULAR_DAMPING", "0.15")),
-        )
+        if engine != int(mujoco_engine):
+            _set_engine_float(
+                sim,
+                handle,
+                "bullet_body_lineardamping",
+                float(os.environ.get("ROBOT_GRASP_PHYSICS_LINEAR_DAMPING", "0.08")),
+            )
+            _set_engine_float(
+                sim,
+                handle,
+                "bullet_body_angulardamping",
+                float(os.environ.get("ROBOT_GRASP_PHYSICS_ANGULAR_DAMPING", "0.15")),
+            )
         density = float(os.environ.get("ROBOT_GRASP_PHYSICS_DENSITY", "800"))
         try:
             sim.computeMassAndInertia(handle, density)
@@ -471,44 +574,74 @@ def _settle_simulation(
     sim: Any,
     handles: list[int],
     aliases: dict[int, str],
+    client: Any,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+    """Settle bodies with the caller's API session.
 
-    step_client = RemoteAPIClient()
-    step_client.setStepping(True)
-    sim.startSimulation()
-    started = time.monotonic()
-    stable_steps = 0
-    window_size = max(STABLE_STEPS_REQUIRED * 2, STABLE_STEPS_REQUIRED)
-    quiet_window: deque[bool] = deque(maxlen=window_size)
-    max_linear = float("inf")
-    max_angular = float("inf")
-    while time.monotonic() - started < SETTLE_TIMEOUT_S:
-        step_client.step()
-        max_linear, max_angular = _speed_stats(sim, handles)
-        quiet_window.append(
-            max_linear <= LINEAR_SPEED_THRESHOLD
-            and max_angular <= ANGULAR_SPEED_THRESHOLD
-        )
-        stable_steps = int(sum(quiet_window))
-        if len(quiet_window) == window_size and stable_steps >= STABLE_STEPS_REQUIRED:
-            break
-
-    timed_out = not (
-        len(quiet_window) == window_size
-        and stable_steps >= STABLE_STEPS_REQUIRED
+    A previous implementation opened a second ``RemoteAPIClient`` only for
+    stepping.  That leaves the server-side coroutine waiting when another
+    pipeline stage stops the simulation or the process exits early, which is
+    the direct cause of the ``ZMQ remote API server: abort execution`` popup.
+    The scene generator now passes its one and only client here.  This function
+    deliberately has no fallback client: creating one would reintroduce two
+    independent ZMQ sessions controlling the same simulation.
+    """
+    if client is None:
+        raise ValueError("_settle_simulation requires the scene generator's RemoteAPIClient")
+    stepping_enabled = False
+    engine = _physics_engine(sim)
+    engine_name = (
+        "mujoco"
+        if engine == int(getattr(sim, "physics_mujoco", 4))
+        else str(engine)
     )
-    final_contacts = _collect_contacts(sim, set(handles), aliases)
-    sim.pauseSimulation()
-    # Keep the settled bodies dynamic. Pausing the simulation is sufficient
-    # for deterministic RGB-D capture; changing shapeintparam_static to 1
-    # would make a later RG2 grasp physically unable to lift the object.
-    _zero_object_velocities(sim, handles)
     try:
-        step_client.setStepping(False)
-    except Exception:
-        pass
+        client.setStepping(True)
+        stepping_enabled = True
+        sim.startSimulation()
+        started = time.monotonic()
+        stable_steps = 0
+        window_size = max(STABLE_STEPS_REQUIRED * 2, STABLE_STEPS_REQUIRED)
+        quiet_window: deque[bool] = deque(maxlen=window_size)
+        max_linear = float("inf")
+        max_angular = float("inf")
+        while time.monotonic() - started < SETTLE_TIMEOUT_S:
+            client.step()
+            max_linear, max_angular = _speed_stats(sim, handles)
+            quiet_window.append(
+                max_linear <= LINEAR_SPEED_THRESHOLD
+                and max_angular <= ANGULAR_SPEED_THRESHOLD
+            )
+            stable_steps = int(sum(quiet_window))
+            if len(quiet_window) == window_size and stable_steps >= STABLE_STEPS_REQUIRED:
+                break
+
+        timed_out = not (
+            len(quiet_window) == window_size
+            and stable_steps >= STABLE_STEPS_REQUIRED
+        )
+        final_contacts = _collect_contacts(sim, set(handles), aliases)
+        try:
+            for sensor in sim.getObjectsInTree(sim.handle_scene, sim.sceneobject_visionsensor, 0):
+                try:
+                    sim.handleVisionSensor(int(sensor))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        sim.pauseSimulation()
+        _zero_object_velocities(sim, handles)
+    finally:
+        # Always release this client's stepping level before returning control
+        # to the next subprocess.  The caller owns and closes the client.
+        if stepping_enabled:
+            try:
+                client.setStepping(False)
+            except Exception:
+                pass
     settle_info = {
+        "physics_engine": engine_name,
+        "physics_engine_id": engine,
         "settled_by_timeout": timed_out,
         "quiet_steps_in_window": stable_steps,
         "quiet_window_size": window_size,
@@ -529,8 +662,17 @@ def generate_physics_scene(
     robot_base: int,
     reference: dict[str, Any],
     camera_model: dict[str, Any],
+    client: Any,
 ) -> list[dict[str, Any]]:
     """Generate, settle and pause a dynamic scene, returning final GT records."""
+
+    engine = _physics_engine(sim)
+    engine_name = (
+        "mujoco"
+        if engine == int(getattr(sim, "physics_mujoco", 4))
+        else str(engine)
+    )
+    print(f"Physics engine selected by CoppeliaSim: {engine_name}")
 
     from scene_randomizer import COLOR_PALETTE
 
@@ -567,6 +709,7 @@ def generate_physics_scene(
         # through gravity.  The real dynamic controller is installed later by
         # visual_servo_runner, after perception has finished.
         _set_robot_kinematic_for_settle(sim, robot_configuration)
+        _freeze_robot_shapes_for_settle(sim, robot_configuration)
         robot_collision_state = _suspend_robot_collisions(sim, robot_base)
         wall_handles = _make_containment_walls(sim, robot_base, reference)
         for index, class_name in enumerate(classes):
@@ -623,7 +766,15 @@ def generate_physics_scene(
                 }
             )
 
-        contacts, settle_info = _settle_simulation(sim, handles, aliases)
+        contacts, settle_info = _settle_simulation(sim, handles, aliases, client=client)
+        # The arm was kinematic during the drop, but dynamic proxy shapes can
+        # still retain a tiny solver velocity after the pause.  Clear it before
+        # handing the scene to RGB-D and the later controller.
+        _zero_robot_velocities(sim, robot_base)
+        # Keep the entire robot/gripper collision tree frozen during RGB-D,
+        # segmentation and active second-view stages.  The dynamic controller
+        # explicitly re-enables these shapes when it takes ownership.
+        _freeze_robot_shapes_for_settle(sim, robot_configuration)
         _restore_robot_configuration(sim, robot_base, robot_configuration)
         _restore_robot_collisions(sim, robot_collision_state)
         robot_collision_state = []
@@ -655,6 +806,7 @@ def generate_physics_scene(
         return records
     except Exception:
         try:
+            _restore_robot_shape_flags(sim, robot_configuration)
             _restore_robot_configuration(sim, robot_base, robot_configuration)
         except Exception:
             pass

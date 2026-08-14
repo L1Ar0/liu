@@ -22,7 +22,7 @@ except ImportError as exc:
         "python -m pip install scipy"
     ) from exc
 
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 
 from point_cloud import (
     find_unique_object_by_alias,

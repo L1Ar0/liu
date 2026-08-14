@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 
 
 FLANGE_TIP_PATH = "/iiwa_tip"

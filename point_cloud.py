@@ -15,7 +15,7 @@ except ImportError as exc:
         "python -m pip install open3d"
     ) from exc
 
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 
 
 # ============================================================
@@ -155,8 +155,15 @@ def capture_rgbd(
 
     print("\n正在处理 RGB-D Vision Sensor...")
 
-    # Explicit handling = ON 时需要这一句
+    # Explicit handling = ON 时需要这一句. Physics scene generation renders
+    # once before pausing, and this direct call safely refreshes the frame.
     sim.handleVisionSensor(camera)
+    # Never start/stop a paused simulation from this low-level capture helper.
+    # Physics scene generation already renders all explicit-handling sensors
+    # before pausing.  Starting a new simulation here used to require a second
+    # stepping client and could strand the ZMQ add-on coroutine when a stage
+    # failed or was interrupted.  A direct handle call is safe in both the
+    # stopped and paused states.
 
     # --------------------------------------------------------
     # RGB

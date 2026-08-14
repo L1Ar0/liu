@@ -1,7 +1,7 @@
 import math
 import time
 
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 
 
 # 机械臂运动被分成多少个小步

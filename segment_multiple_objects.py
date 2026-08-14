@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 
 from geometric_segmentation import refine_geometric_clusters
 

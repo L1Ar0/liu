@@ -2,7 +2,7 @@ import math
 import re
 import time
 
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from remote_session import RemoteAPIClient
 
 
 def get_joint_number(sim, joint_handle: int) -> int:
